@@ -10,6 +10,38 @@ module Kml
       @server_name = "#{config.service_name}-sandbox"
     end
 
+    def service_name
+      @config.service_name
+    end
+
+    def code_path
+      @config.code_path
+    end
+
+    def server_ip
+      server = @hetzner.find_server(@server_name)
+      raise Error, "No sandbox server found" unless server
+
+      @hetzner.server_ip(server)
+    end
+
+    def remote_exec(cmd)
+      ip = server_ip
+      `ssh -o StrictHostKeyChecking=no deploy@#{ip} #{Shellwords.escape(cmd)}`
+    end
+
+    def anthropic_env_vars
+      api_key = ENV["ANTHROPIC_AUTH_TOKEN"] || load_env_var("ANTHROPIC_AUTH_TOKEN") ||
+                ENV["ANTHROPIC_API_KEY"] || load_env_var("ANTHROPIC_API_KEY")
+      raise Error, "ANTHROPIC_AUTH_TOKEN not set. Run 'kml init' first." unless api_key
+
+      base_url = ENV["ANTHROPIC_BASE_URL"] || load_env_var("ANTHROPIC_BASE_URL")
+
+      env_vars = "ANTHROPIC_API_KEY=#{Shellwords.escape(api_key)}"
+      env_vars += " ANTHROPIC_BASE_URL=#{Shellwords.escape(base_url)}" if base_url
+      env_vars
+    end
+
     def deploy
       print "[1/4] Provision server..."
       @ip = provision_or_find_server

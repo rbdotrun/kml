@@ -29,10 +29,8 @@ module Kml
       sandbox.ssh
     end
 
-    desc "claude PROMPT", "Run Claude Code on sandbox"
-    def claude(prompt)
-      sandbox.claude(prompt)
-    end
+    desc "session SUBCOMMAND ...ARGS", "Manage Claude sessions"
+    subcommand "session", SessionCLI
 
     private
 
