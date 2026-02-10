@@ -4,6 +4,11 @@ require "thor"
 
 module Kml
   class CLI < Thor
+    desc "init", "Setup credentials for kml"
+    def init
+      Setup.new.run
+    end
+
     desc "deploy", "Provision server and deploy sandbox"
     def deploy
       sandbox.deploy
@@ -19,19 +24,31 @@ module Kml
       sandbox.exec(command)
     end
 
+    desc "ssh", "SSH into sandbox server"
+    def ssh
+      sandbox.ssh
+    end
+
+    desc "claude PROMPT", "Run Claude Code on sandbox"
+    def claude(prompt)
+      sandbox.claude(prompt)
+    end
+
     private
 
     def sandbox
-      token = ENV.fetch("HETZNER_API_TOKEN") { load_env_token }
+      token = ENV.fetch("HETZNER_API_TOKEN") { load_env_var("HETZNER_API_TOKEN") }
+      raise Error, "HETZNER_API_TOKEN not set. Run 'kml init' first." unless token
+
       hetzner = Hetzner.new(token: token)
       config = Config.new
       Sandbox.new(hetzner: hetzner, config: config)
     end
 
-    def load_env_token
+    def load_env_var(name)
       return unless File.exist?(".env")
 
-      File.read(".env")[/HETZNER_API_TOKEN=(.+)/, 1]
+      File.read(".env")[/#{name}=(.+)/, 1]&.strip
     end
   end
 end

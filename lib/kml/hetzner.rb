@@ -22,7 +22,7 @@ module Kml
       servers&.first
     end
 
-    def create_server(name:, server_type: "cx22", image: "ubuntu-24.04", location: "nbg1", user_data: nil)
+    def create_server(name:, server_type: "cx23", image: "ubuntu-24.04", location: "nbg1", user_data: nil)
       payload = {
         name: name,
         server_type: server_type,
@@ -32,7 +32,13 @@ module Kml
       payload[:user_data] = user_data if user_data
 
       response = @conn.post("servers", payload)
-      response.body["server"]
+      body = response.body
+
+      if body["error"]
+        raise Error, "Hetzner API error: #{body['error']['message']}"
+      end
+
+      body["server"]
     end
 
     def delete_server(id)
@@ -61,6 +67,12 @@ module Kml
     def cloud_init_script(ssh_public_key)
       <<~YAML
         #cloud-config
+        package_update: true
+        packages:
+          - docker.io
+          - git
+          - jq
+          - rsync
         users:
           - name: deploy
             groups: sudo,docker
@@ -68,9 +80,13 @@ module Kml
             sudo: ALL=(ALL) NOPASSWD:ALL
             ssh_authorized_keys:
               - #{ssh_public_key}
-        package_update: true
-        packages:
-          - docker.io
+        runcmd:
+          - curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+          - apt-get install -y nodejs
+          - npm install -g @anthropic-ai/claude-code
+          - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          - echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list
+          - apt-get update && apt-get install -y gh
       YAML
     end
   end
