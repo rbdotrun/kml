@@ -76,8 +76,8 @@ module Kml
       end
 
       sandbox = build_sandbox
-      puts format("%-20s %-10s %-6s %s", "SLUG", "STATUS", "PORT", "BRANCH")
-      puts "-" * 60
+      puts format("%-20s %-10s %s", "SLUG", "STATUS", "URL")
+      puts "-" * 70
 
       sessions.each do |slug, data|
         session = Session.new(
@@ -90,7 +90,8 @@ module Kml
           sandbox: sandbox
         )
         status = session.running? ? "running" : "stopped"
-        puts format("%-20s %-10s %-6s %s", slug, status, data[:port], data[:branch])
+        url = session.public_url || "port:#{data[:port]}"
+        puts format("%-20s %-10s %s", slug, status, url)
       end
     rescue Error => e
       puts "Error: #{e.message}"

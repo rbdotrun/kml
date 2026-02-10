@@ -83,7 +83,10 @@ module Kml
           bash -c "bin/rails db:prepare && bin/rails assets:precompile && bin/rails s -b 0.0.0.0"
       SH
 
-      # 4. Create tmux session with 2 windows
+      # 4. Setup tunnel ingress
+      @public_url = setup_tunnel_ingress
+
+      # 5. Create tmux session with 2 windows
       @sandbox.remote_exec(<<~SH)
         tmux kill-session -t #{tmux_name} 2>/dev/null || true
         tmux new-session -d -s #{tmux_name} -n app
@@ -91,7 +94,7 @@ module Kml
         tmux new-window -t #{tmux_name} -n claude
       SH
 
-      # 5. Start Claude in tmux
+      # 6. Start Claude in tmux
       claude_cmd = build_claude_cmd(
         prompt: prompt,
         new_session: true,
@@ -100,9 +103,10 @@ module Kml
       )
       @sandbox.remote_exec("tmux send-keys -t #{tmux_name}:claude #{Shellwords.escape(claude_cmd)} Enter")
 
-      # 6. Attach or print message
+      # 7. Attach or print message
       if detached
         puts "Session '#{slug}' started in background."
+        puts "URL: https://#{@public_url}" if @public_url
         puts "Use 'kml session continue #{slug}' to attach."
       else
         attach!
@@ -133,6 +137,8 @@ module Kml
 
     def delete!
       stop!
+      # Remove tunnel ingress
+      remove_tunnel_ingress
       # Remove worktree
       @sandbox.remote_exec("cd #{main_code_path} && git worktree remove #{worktree_path} --force 2>/dev/null || true")
       @sandbox.remote_exec("rm -rf #{worktree_path}")
@@ -140,6 +146,12 @@ module Kml
       @sandbox.remote_exec("docker exec #{postgres_container} dropdb -U app #{database} 2>/dev/null || true")
       # Remove from local storage
       SessionStore.delete(slug)
+    end
+
+    def public_url
+      cf = @sandbox.cloudflare
+      return nil unless cf
+      "sandbox-#{slug}.#{cf.domain}"
     end
 
     def build_claude_cmd(prompt: nil, new_session: true, print_mode: false, json_mode: false)
@@ -186,6 +198,22 @@ module Kml
           tmux new-window -t #{tmux_name} -n claude
         SH
       end
+    end
+
+    def setup_tunnel_ingress
+      cf = @sandbox.cloudflare
+      tunnel_id = @sandbox.tunnel_id
+      return nil unless cf && tunnel_id
+
+      cf.add_session_ingress(tunnel_id, slug, port)
+    end
+
+    def remove_tunnel_ingress
+      cf = @sandbox.cloudflare
+      tunnel_id = @sandbox.tunnel_id
+      return unless cf && tunnel_id
+
+      cf.remove_session_ingress(tunnel_id, slug)
     end
   end
 end

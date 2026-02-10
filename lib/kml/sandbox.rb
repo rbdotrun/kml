@@ -43,27 +43,38 @@ module Kml
     end
 
     def deploy
-      print "[1/4] Provision server..."
+      print "[1/5] Provision server..."
       @ip = provision_or_find_server
 
-      step(2, "Generate sandbox config") do
+      step(2, "Generate sandbox config", steps: 5) do
         @config.generate_sandbox(ip: @ip)
         @config.write_sandbox_config
         @config.write_sandbox_secrets
       end
-      step(3, "Sync code") { sync_code(@ip) }
+      step(3, "Sync code", steps: 5) { sync_code(@ip) }
 
       if sandbox_running?(@ip)
-        puts "[4/4] App already running ✓"
+        puts "[4/5] App already running ✓"
       else
-        step(4, "Kamal setup") { run_kamal_setup }
+        step(4, "Kamal setup", steps: 5) { run_kamal_setup }
       end
+
+      step(5, "Setup tunnel", steps: 5) { setup_tunnel(@ip) }
 
       puts "\n✓ Sandbox ready at #{@ip}"
       @ip
     end
 
     def destroy
+      # Delete tunnel first
+      if (cf = cloudflare)
+        tunnel = cf.find_tunnel(tunnel_name)
+        if tunnel
+          puts "Deleting tunnel..."
+          cf.delete_tunnel(tunnel[:id])
+        end
+      end
+
       server = @hetzner.find_server(@server_name)
       if server
         puts "Deleting server #{server['id']}..."
@@ -72,6 +83,38 @@ module Kml
       else
         puts "No server found."
       end
+    end
+
+    def tunnel_name
+      "kml-#{@config.service_name}-sandbox"
+    end
+
+    def tunnel_id
+      return @tunnel_id if defined?(@tunnel_id)
+
+      cf = cloudflare
+      return nil unless cf
+
+      tunnel = cf.find_tunnel(tunnel_name)
+      @tunnel_id = tunnel&.dig(:id)
+    end
+
+    def cloudflare
+      return @cloudflare if defined?(@cloudflare)
+
+      api_token = ENV["CLOUDFLARE_API_TOKEN"] || load_env_var("CLOUDFLARE_API_TOKEN")
+      account_id = ENV["CLOUDFLARE_ACCOUNT_ID"] || load_env_var("CLOUDFLARE_ACCOUNT_ID")
+      zone_id = ENV["CLOUDFLARE_ZONE_ID"] || load_env_var("CLOUDFLARE_ZONE_ID")
+      domain = ENV["CLOUDFLARE_DOMAIN"] || load_env_var("CLOUDFLARE_DOMAIN")
+
+      return nil unless api_token && account_id && zone_id && domain
+
+      @cloudflare = Cloudflare.new(
+        api_token: api_token,
+        account_id: account_id,
+        zone_id: zone_id,
+        domain: domain
+      )
     end
 
     def exec(command)
@@ -166,8 +209,8 @@ module Kml
       )
     end
 
-    def step(num, name, show_done: true)
-      print "[#{num}/4] #{name}..."
+    def step(num, name, show_done: true, steps: 5)
+      print "[#{num}/#{steps}] #{name}..."
       $stdout.flush
       result = yield
       puts " ✓" if show_done
@@ -291,6 +334,27 @@ module Kml
       unless system("kamal", "setup", "-d", "sandbox")
         raise Error, "Kamal setup failed"
       end
+    end
+
+    def setup_tunnel(ip)
+      cf = cloudflare
+      return unless cf
+
+      # Create or find tunnel
+      tunnel = cf.find_or_create_tunnel(tunnel_name)
+      token = cf.get_tunnel_token(tunnel[:id])
+
+      # Initialize tunnel config with catch-all
+      cf.put_tunnel_config(tunnel[:id], [{ "service" => "http_status:404" }])
+
+      # Run cloudflared in Docker
+      system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "docker rm -f cloudflared 2>/dev/null; " \
+        "docker run -d --name cloudflared --network host --restart unless-stopped " \
+        "cloudflare/cloudflared:latest tunnel --no-autoupdate run --token #{token}",
+        out: File::NULL
+      )
     end
 
     def sandbox_running?(ip)
