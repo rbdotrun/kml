@@ -34,11 +34,15 @@ module Kml
     end
 
     def postgres_container
-      "#{@sandbox.service_name}-sandbox-db"
+      @sandbox.db_container_name
     end
 
     def docker_image
-      "localhost:5001/#{@sandbox.service_name}:latest-sandbox"
+      @sandbox.image_name
+    end
+
+    def docker_network
+      Sandbox::NETWORK
     end
 
     def running?
@@ -70,7 +74,7 @@ module Kml
         docker rm -f #{container_name} 2>/dev/null || true
         docker run -d \
           --name #{container_name} \
-          --network kamal \
+          --network #{docker_network} \
           -v #{worktree_path}:/rails \
           -p #{port}:3000 \
           -e RAILS_ENV=development \
@@ -177,7 +181,7 @@ module Kml
         docker rm -f #{container_name} 2>/dev/null || true
         docker run -d \
           --name #{container_name} \
-          --network kamal \
+          --network #{docker_network} \
           -v #{worktree_path}:/rails \
           -p #{port}:3000 \
           -e RAILS_ENV=development \

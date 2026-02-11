@@ -4,6 +4,9 @@ require "shellwords"
 
 module Kml
   class Sandbox
+    NETWORK = "kml"
+    POSTGRES_PASSWORD = "sandbox123"
+
     def initialize(hetzner:, config:)
       @hetzner = hetzner
       @config = config
@@ -30,6 +33,11 @@ module Kml
       `ssh -o StrictHostKeyChecking=no deploy@#{ip} #{Shellwords.escape(cmd)}`
     end
 
+    def remote_exec_stream(cmd)
+      ip = server_ip
+      system("ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}", cmd)
+    end
+
     def anthropic_env_vars
       api_key = ENV["ANTHROPIC_AUTH_TOKEN"] || load_env_var("ANTHROPIC_AUTH_TOKEN") ||
                 ENV["ANTHROPIC_API_KEY"] || load_env_var("ANTHROPIC_API_KEY")
@@ -46,20 +54,15 @@ module Kml
       print "[1/5] Provision server..."
       @ip = provision_or_find_server
 
-      step(2, "Generate sandbox config", steps: 5) do
-        @config.generate_sandbox(ip: @ip)
-        @config.write_sandbox_config
-        @config.write_sandbox_secrets
-      end
-      step(3, "Sync code", steps: 5) { sync_code(@ip) }
+      step(2, "Sync code") { sync_code(@ip) }
 
       if sandbox_running?(@ip)
-        puts "[4/5] App already running ✓"
+        puts "[3/5] App already running ✓"
       else
-        step(4, "Kamal setup", steps: 5) { run_kamal_setup }
+        step(3, "Build & run containers") { build_and_run(@ip) }
       end
 
-      step(5, "Setup tunnel", steps: 5) { setup_tunnel(@ip) }
+      step(4, "Setup tunnel") { setup_tunnel(@ip) }
 
       puts "\n✓ Sandbox ready at #{@ip}"
       @ip
@@ -118,7 +121,7 @@ module Kml
     end
 
     def exec(command)
-      system("kamal", "app", "exec", "-d", "sandbox", "--reuse", command)
+      remote_exec_stream("docker exec -it #{app_container_name} #{command}")
     end
 
     def ssh
@@ -129,26 +132,17 @@ module Kml
       Kernel.exec("ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}")
     end
 
-    def claude(prompt)
-      server = @hetzner.find_server(@server_name)
-      raise Error, "No sandbox server found" unless server
+    # Container names
+    def app_container_name
+      "#{service_name}-app"
+    end
 
-      ip = @hetzner.server_ip(server)
+    def db_container_name
+      "#{service_name}-db"
+    end
 
-      # Support both new (AUTH_TOKEN) and old (API_KEY) env var names
-      api_key = ENV["ANTHROPIC_AUTH_TOKEN"] || load_env_var("ANTHROPIC_AUTH_TOKEN") ||
-                ENV["ANTHROPIC_API_KEY"] || load_env_var("ANTHROPIC_API_KEY")
-      raise Error, "ANTHROPIC_AUTH_TOKEN not set. Run 'kml init' first." unless api_key
-
-      base_url = ENV["ANTHROPIC_BASE_URL"] || load_env_var("ANTHROPIC_BASE_URL")
-
-      code_path = @config.code_path
-      env_vars = "ANTHROPIC_API_KEY=#{Shellwords.escape(api_key)}"
-      env_vars += " ANTHROPIC_BASE_URL=#{Shellwords.escape(base_url)}" if base_url
-
-      cmd = "cd #{code_path} && #{env_vars} claude -p --dangerously-skip-permissions #{Shellwords.escape(prompt)}"
-
-      Kernel.exec("ssh", "-tt", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}", cmd)
+    def image_name
+      "#{service_name}:sandbox"
     end
 
     private
@@ -159,19 +153,15 @@ module Kml
     end
 
     def github_token
-      # 1. gh CLI (most common)
       token = `gh auth token 2>/dev/null`.strip
       return token unless token.empty?
 
-      # 2. Environment variable
       token = ENV["GITHUB_TOKEN"] || ENV["GH_TOKEN"]
       return token if token && !token.empty?
 
-      # 3. .env file
       token = load_env_var("GITHUB_TOKEN") || load_env_var("GH_TOKEN")
       return token if token && !token.empty?
 
-      # 4. git credential helper
       token = `echo "protocol=https\nhost=github.com" | git credential fill 2>/dev/null | grep password | cut -d= -f2`.strip
       return token unless token.empty?
 
@@ -189,12 +179,10 @@ module Kml
     end
 
     def setup_ssh_key(ip)
-      # Find local SSH key
       key_paths = %w[~/.ssh/id_ed25519 ~/.ssh/id_rsa].map { |p| File.expand_path(p) }
       private_key = key_paths.find { |p| File.exist?(p) }
       return unless private_key
 
-      # Copy to server
       system(
         "scp", "-o", "StrictHostKeyChecking=no",
         private_key, "deploy@#{ip}:~/.ssh/",
@@ -278,7 +266,6 @@ module Kml
 
     def wait_for_docker(ip)
       puts ""
-      # Stream cloud-init with forced line buffering via stdbuf, kill when docker ready
       system(
         "ssh", "-tt", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
         "sudo stdbuf -oL tail -f /var/log/cloud-init-output.log | " \
@@ -286,7 +273,6 @@ module Kml
         "PID=$!; while ! docker version >/dev/null 2>&1; do sleep 2; done; kill $PID 2>/dev/null; echo '    Docker ready'"
       )
     end
-
 
     def sync_code(ip)
       code_path = @config.code_path
@@ -299,7 +285,6 @@ module Kml
         raise Error, "Failed to create code directory"
       end
 
-      # Sync including .git for gitops
       unless system(
         "rsync", "-az",
         "--exclude=tmp", "--exclude=log", "--exclude=node_modules",
@@ -308,7 +293,13 @@ module Kml
         raise Error, "Failed to sync code"
       end
 
-      # Setup git auth - always copy SSH key, also try gh auth if token available
+      # Create directories needed by Dockerfile
+      system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "cd #{code_path} && mkdir -p log tmp storage",
+        out: File::NULL
+      )
+
       setup_ssh_key(ip)
 
       if (token = github_token)
@@ -319,7 +310,6 @@ module Kml
         )
       end
 
-      # Configure git user
       system(
         "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
         "git config --global user.name '#{git_user_name}' && git config --global user.email '#{git_user_email}'",
@@ -327,27 +317,109 @@ module Kml
       )
     end
 
-    def run_kamal_setup
-      puts "" # newline before kamal output
-      # Release any stale lock first
-      system("kamal", "lock", "release", "-d", "sandbox", out: File::NULL, err: File::NULL)
-      unless system("kamal", "setup", "-d", "sandbox")
-        raise Error, "Kamal setup failed"
+    def build_and_run(ip)
+      puts "" # newline before build output
+
+      # Create network
+      system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "docker network create #{NETWORK} 2>/dev/null || true",
+        out: File::NULL
+      )
+
+      # Build image on server
+      puts "    Building image..."
+      unless system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "cd #{code_path} && docker build -t #{image_name} ."
+      )
+        raise Error, "Docker build failed"
       end
+
+      # Run postgres
+      puts "    Starting postgres..."
+      system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "docker rm -f #{db_container_name} 2>/dev/null || true"
+      )
+      unless system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "docker run -d " \
+        "--name #{db_container_name} " \
+        "--network #{NETWORK} " \
+        "--restart unless-stopped " \
+        "-e POSTGRES_USER=app " \
+        "-e POSTGRES_PASSWORD=#{POSTGRES_PASSWORD} " \
+        "-e POSTGRES_DB=app_sandbox " \
+        "-v #{service_name}_pgdata:/var/lib/postgresql/data " \
+        "postgres:17",
+        out: File::NULL
+      )
+        raise Error, "Failed to start postgres"
+      end
+
+      # Wait for postgres
+      print "    Waiting for postgres..."
+      10.times do
+        sleep 1
+        result = `ssh -o StrictHostKeyChecking=no deploy@#{ip} "docker exec #{db_container_name} pg_isready -U app 2>/dev/null"`.strip
+        if result.include?("accepting connections")
+          puts " ok"
+          break
+        end
+        print "."
+      end
+
+      # Run app
+      puts "    Starting app..."
+      system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "docker rm -f #{app_container_name} 2>/dev/null || true"
+      )
+      unless system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "docker run -d " \
+        "--name #{app_container_name} " \
+        "--network #{NETWORK} " \
+        "--restart unless-stopped " \
+        "-v #{code_path}:/rails " \
+        "-p 3000:3000 " \
+        "-e RAILS_ENV=development " \
+        "-e RAILS_LOG_TO_STDOUT=1 " \
+        "-e POSTGRES_HOST=#{db_container_name} " \
+        "-e POSTGRES_USER=app " \
+        "-e POSTGRES_PASSWORD=#{POSTGRES_PASSWORD} " \
+        "-e POSTGRES_DB=app_sandbox " \
+        "#{image_name} " \
+        "bash -c 'bin/rails db:prepare && bin/rails s -b 0.0.0.0'",
+        out: File::NULL
+      )
+        raise Error, "Failed to start app"
+      end
+
+      # Wait for app to be healthy
+      print "    Waiting for app..."
+      30.times do
+        sleep 2
+        result = `ssh -o StrictHostKeyChecking=no deploy@#{ip} "curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/up 2>/dev/null"`.strip
+        if result == "200"
+          puts " ok"
+          return
+        end
+        print "."
+      end
+      puts " timeout (app may still be starting)"
     end
 
     def setup_tunnel(ip)
       cf = cloudflare
       return unless cf
 
-      # Create or find tunnel
       tunnel = cf.find_or_create_tunnel(tunnel_name)
       token = cf.get_tunnel_token(tunnel[:id])
 
-      # Initialize tunnel config with catch-all
       cf.put_tunnel_config(tunnel[:id], [{ "service" => "http_status:404" }])
 
-      # Run cloudflared in Docker
       system(
         "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
         "docker rm -f cloudflared 2>/dev/null; " \
@@ -358,8 +430,7 @@ module Kml
     end
 
     def sandbox_running?(ip)
-      # Check if sandbox container is running
-      output = `ssh -o StrictHostKeyChecking=no deploy@#{ip} "docker ps --filter name=#{@config.service_name}-sandbox-web -q" 2>/dev/null`.strip
+      output = `ssh -o StrictHostKeyChecking=no deploy@#{ip} "docker ps --filter name=#{app_container_name} -q" 2>/dev/null`.strip
       !output.empty?
     end
   end

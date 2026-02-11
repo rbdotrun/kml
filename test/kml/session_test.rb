@@ -24,12 +24,12 @@ class SessionTest < Minitest::Test
 
   def test_postgres_container
     session = Kml::Session.new(slug: "auth", sandbox: @mock_sandbox)
-    assert_equal "dummy-rails-sandbox-db", session.postgres_container
+    assert_equal "dummy-rails-db", session.postgres_container
   end
 
   def test_docker_image
     session = Kml::Session.new(slug: "auth", sandbox: @mock_sandbox)
-    assert_equal "localhost:5001/dummy-rails:latest-sandbox", session.docker_image
+    assert_equal "dummy-rails:sandbox", session.docker_image
   end
 
   def test_database_name_with_dashes
@@ -151,6 +151,14 @@ class SessionTest < Minitest::Test
 
     def anthropic_env_vars
       "ANTHROPIC_API_KEY=test-key"
+    end
+
+    def db_container_name
+      "dummy-rails-db"
+    end
+
+    def image_name
+      "dummy-rails:sandbox"
     end
   end
 end
