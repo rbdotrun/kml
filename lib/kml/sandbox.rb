@@ -7,6 +7,7 @@ module Kml
   class Sandbox
     SETUP_COMMANDS = [
       { name: "Update apt", cmd: "sudo apt-get update" },
+      { name: "Configure firewall", cmd: "sudo ufw allow 22/tcp && sudo ufw --force enable" },
       { name: "Install build tools", cmd: "sudo apt-get install -y git rsync build-essential libssl-dev libreadline-dev zlib1g-dev libyaml-dev tmux libpq-dev" },
       { name: "Install postgres", cmd: "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql postgresql-contrib || sudo dpkg --configure -a" },
       { name: "Create postgres user", cmd: "sudo -u postgres createuser -s deploy 2>/dev/null || true" },
