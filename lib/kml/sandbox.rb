@@ -217,9 +217,9 @@ module Kml
       puts "\n✓ Snapshot '#{SNAPSHOT_NAME}' created"
     end
 
-    def snapshot_from_sandbox
-      server = @hetzner.find_server(@server_name)
-      raise Error, "No sandbox running. Use 'kml snapshot' to create from scratch." unless server
+    def snapshot_from_server(server_name)
+      server = @hetzner.find_server(server_name)
+      raise Error, "Server '#{server_name}' not found. Use 'kml snapshot' to create from scratch." unless server
 
       # Delete existing snapshot if any
       existing = @hetzner.find_snapshot(SNAPSHOT_NAME)
@@ -229,8 +229,8 @@ module Kml
         puts " ✓"
       end
 
-      # Create snapshot from running sandbox
-      print "Creating snapshot from sandbox..."
+      # Create snapshot from server
+      print "Creating snapshot from '#{server_name}'..."
       @hetzner.create_snapshot(server["id"], SNAPSHOT_NAME)
 
       # Wait for snapshot to be ready
@@ -241,7 +241,7 @@ module Kml
       end
       puts " ✓"
 
-      puts "\n✓ Snapshot '#{SNAPSHOT_NAME}' created from sandbox"
+      puts "\n✓ Snapshot '#{SNAPSHOT_NAME}' created from '#{server_name}'"
     end
 
     def snapshot_delete

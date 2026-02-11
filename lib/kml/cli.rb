@@ -29,10 +29,10 @@ module Kml
       sandbox.ssh
     end
 
-    desc "snapshot [SOURCE]", "Create base image snapshot (SOURCE: blank=fresh, 'sandbox'=from running sandbox)"
-    def snapshot(source = nil)
-      if source == "sandbox"
-        sandbox.snapshot_from_sandbox
+    desc "snapshot [SERVER]", "Create base image snapshot (SERVER: blank=fresh, or server name to snapshot)"
+    def snapshot(server_name = nil)
+      if server_name
+        sandbox.snapshot_from_server(server_name)
       else
         sandbox.snapshot_create
       end
