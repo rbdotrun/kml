@@ -432,35 +432,40 @@ module Kml
         "bin/rails tailwindcss:build 2>/dev/null || true"
       )
 
-      # Start the web process from Procfile.dev (or fallback)
-      web_command = processes["web"] || "bin/rails s -b 0.0.0.0"
-      container = process_container_name("web")
-      puts "    Starting web..."
+      # Start each Procfile process as a container
+      processes.each do |name, command|
+        container = process_container_name(name)
+        puts "    Starting #{name}..."
 
-      system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "docker rm -f #{container} 2>/dev/null || true"
-      )
+        system(
+          "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+          "docker rm -f #{container} 2>/dev/null || true"
+        )
 
-      unless system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "docker run -d " \
-        "--name #{container} " \
-        "--network #{NETWORK} " \
-        "--restart unless-stopped " \
-        "-v #{code_path}:/rails " \
-        "-p 3000:3000 " \
-        "-e RAILS_ENV=development " \
-        "-e RAILS_LOG_TO_STDOUT=1 " \
-        "-e POSTGRES_HOST=#{db_container_name} " \
-        "-e POSTGRES_USER=app " \
-        "-e POSTGRES_PASSWORD=#{POSTGRES_PASSWORD} " \
-        "-e POSTGRES_DB=app_sandbox " \
-        "#{image_name} " \
-        "bash -c #{Shellwords.escape(web_command)}",
-        out: File::NULL
-      )
-        raise Error, "Failed to start web"
+        # Web process gets port mapping
+        port_mapping = name == "web" ? "-p 3000:3000 " : ""
+
+        # Use -t for pseudo-TTY (needed for watch processes)
+        unless system(
+          "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+          "docker run -d -t " \
+          "--name #{container} " \
+          "--network #{NETWORK} " \
+          "--restart unless-stopped " \
+          "-v #{code_path}:/rails " \
+          "#{port_mapping}" \
+          "-e RAILS_ENV=development " \
+          "-e RAILS_LOG_TO_STDOUT=1 " \
+          "-e POSTGRES_HOST=#{db_container_name} " \
+          "-e POSTGRES_USER=app " \
+          "-e POSTGRES_PASSWORD=#{POSTGRES_PASSWORD} " \
+          "-e POSTGRES_DB=app_sandbox " \
+          "#{image_name} " \
+          "bash -c #{Shellwords.escape(command)}",
+          out: File::NULL
+        )
+          raise Error, "Failed to start #{name}"
+        end
       end
 
       # Wait for web to be healthy
