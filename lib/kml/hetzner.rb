@@ -74,14 +74,26 @@ module Kml
             sudo: ALL=(ALL) NOPASSWD:ALL
             ssh_authorized_keys:
               - #{ssh_public_key}
-        runcmd:
-          - su - deploy -c 'curl -fsSL https://mise.run | sh'
-          - su - deploy -c '/home/deploy/.local/bin/mise settings set ruby.compile false'
-          - sed -i '1i export PATH="$HOME/.local/bin:$PATH"' /home/deploy/.bashrc
-          - sed -i '2i eval "$(/home/deploy/.local/bin/mise activate bash)"' /home/deploy/.bashrc
-          - curl -fsSL -L https://github.com/DarthSim/overmind/releases/download/v2.5.1/overmind-v2.5.1-linux-amd64.gz | gunzip > /usr/local/bin/overmind && chmod +x /usr/local/bin/overmind
-          - curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
       YAML
+    end
+
+    def find_snapshot(description)
+      response = @conn.get("images", { type: "snapshot" })
+      images = response.body["images"] || []
+      images.find { |img| img["description"] == description }
+    end
+
+    def create_snapshot(server_id, name)
+      response = @conn.post("servers/#{server_id}/actions/create_image", {
+        description: name,
+        type: "snapshot",
+        labels: { "kml" => "true" }
+      })
+      response.body
+    end
+
+    def delete_snapshot(id)
+      @conn.delete("images/#{id}")
     end
   end
 end

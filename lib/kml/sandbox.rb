@@ -5,6 +5,24 @@ require "open3"
 
 module Kml
   class Sandbox
+    SETUP_COMMANDS = [
+      { name: "Update apt", cmd: "sudo apt-get update" },
+      { name: "Install build tools", cmd: "sudo apt-get install -y git rsync build-essential libssl-dev libreadline-dev zlib1g-dev libyaml-dev tmux libpq-dev" },
+      { name: "Install postgres", cmd: "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql postgresql-contrib || sudo dpkg --configure -a" },
+      { name: "Create postgres user", cmd: "sudo -u postgres createuser -s deploy 2>/dev/null || true" },
+      { name: "Configure postgres auth", cmd: "sudo sed -i 's/peer/trust/g; s/scram-sha-256/trust/g' /etc/postgresql/*/main/pg_hba.conf && sudo systemctl restart postgresql" },
+      { name: "Install mise", cmd: "curl -fsSL https://mise.run | sh" },
+      { name: "Configure mise", cmd: 'echo "export PATH=\"$HOME/.local/bin:$PATH\"" >> ~/.bashrc && echo "eval \"$($HOME/.local/bin/mise activate bash)\"" >> ~/.bashrc' },
+      { name: "Configure mise settings", cmd: "~/.local/bin/mise settings set ruby.compile false" },
+      { name: "Install ruby", cmd: "~/.local/bin/mise use -g ruby@3.4" },
+      { name: "Install node", cmd: "~/.local/bin/mise use -g node@20" },
+      { name: "Install overmind", cmd: "sudo curl -fsSL -L https://github.com/DarthSim/overmind/releases/download/v2.5.1/overmind-v2.5.1-linux-amd64.gz | gunzip | sudo tee /usr/local/bin/overmind > /dev/null && sudo chmod +x /usr/local/bin/overmind" },
+      { name: "Install cloudflared", cmd: "sudo curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && sudo chmod +x /usr/local/bin/cloudflared" },
+      { name: "Install claude-code", cmd: "~/.local/bin/mise exec -- npm install -g @anthropic-ai/claude-code" },
+    ].freeze
+
+    SNAPSHOT_NAME = "kml-base"
+
     def initialize(hetzner:, config:)
       @hetzner = hetzner
       @config = config
@@ -143,6 +161,72 @@ module Kml
       end
     end
 
+    def snapshot_create
+      # First, provision a fresh server with setup
+      puts "Creating base server for snapshot..."
+
+      # Delete existing snapshot if any
+      existing = @hetzner.find_snapshot(SNAPSHOT_NAME)
+      if existing
+        print "Deleting existing snapshot..."
+        @hetzner.delete_snapshot(existing["id"])
+        puts " ✓"
+      end
+
+      # Create temporary server
+      temp_name = "kml-snapshot-builder"
+      user_data = @hetzner.cloud_init_script(@config.ssh_public_key)
+
+      print "Creating server..."
+      server = @hetzner.create_server(
+        name: temp_name,
+        user_data: user_data
+      )
+      server = wait_for_server(server["id"])
+      ip = @hetzner.server_ip(server)
+      puts " #{ip}"
+
+      system("ssh-keygen", "-R", ip, out: File::NULL, err: File::NULL)
+
+      print "Waiting for SSH..."
+      wait_for_ssh(ip)
+      puts " ✓"
+
+      wait_for_cloud_init(ip)
+
+      # Run all setup commands
+      run_setup_commands(ip)
+
+      # Create snapshot
+      print "Creating snapshot..."
+      @hetzner.create_snapshot(server["id"], SNAPSHOT_NAME)
+
+      # Wait for snapshot to be ready
+      loop do
+        snap = @hetzner.find_snapshot(SNAPSHOT_NAME)
+        break if snap && snap["status"] == "available"
+        sleep 5
+      end
+      puts " ✓"
+
+      # Delete temporary server
+      print "Cleaning up..."
+      @hetzner.delete_server(server["id"])
+      puts " ✓"
+
+      puts "\n✓ Snapshot '#{SNAPSHOT_NAME}' created"
+    end
+
+    def snapshot_delete
+      snapshot = @hetzner.find_snapshot(SNAPSHOT_NAME)
+      if snapshot
+        @hetzner.delete_snapshot(snapshot["id"])
+        puts "✓ Snapshot deleted"
+      else
+        puts "No snapshot found."
+      end
+    end
+
     def delete_tunnel(tunnel)
       return unless tunnel
 
@@ -203,12 +287,18 @@ module Kml
       end
 
       puts ""
+
+      # Check for existing snapshot
+      snapshot = @hetzner.find_snapshot(SNAPSHOT_NAME)
+      from_snapshot = !!snapshot
+
       user_data = @hetzner.cloud_init_script(@config.ssh_public_key)
 
-      print "    Creating server..."
+      print "    Creating server#{from_snapshot ? ' (from snapshot)' : ''}..."
       server = @hetzner.create_server(
         name: @server_name,
-        user_data: user_data
+        user_data: user_data,
+        image: from_snapshot ? snapshot["id"].to_s : "ubuntu-24.04"
       )
       server = wait_for_server(server["id"])
       ip = @hetzner.server_ip(server)
@@ -220,18 +310,45 @@ module Kml
       wait_for_ssh(ip)
       puts " ok"
 
-      print "    Waiting for cloud-init..."
+      # Wait for cloud-init to finish (just user creation)
       wait_for_cloud_init(ip)
-      puts " ok"
+
+      # Run setup commands if not from snapshot
+      unless from_snapshot
+        run_setup_commands(ip)
+      end
 
       ip
+    end
+
+    def run_setup_commands(ip)
+      total = SETUP_COMMANDS.length
+      SETUP_COMMANDS.each_with_index do |step, idx|
+        print "    [#{idx + 1}/#{total}] #{step[:name]}..."
+        $stdout.flush
+        success = run_remote_command(ip, step[:cmd])
+        if success
+          puts " ✓"
+        else
+          puts " ✗"
+          raise Error, "Setup failed: #{step[:name]}"
+        end
+      end
+    end
+
+    def run_remote_command(ip, cmd)
+      system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "bash -l -c #{Shellwords.escape(cmd)}",
+        out: File::NULL, err: File::NULL
+      )
     end
 
     def wait_for_cloud_init(ip)
       loop do
         result = `ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no deploy@#{ip} cloud-init status 2>/dev/null`.strip
         break if result.include?("done") || result.include?("error")
-        sleep 5
+        sleep 2
       end
     end
 
@@ -273,10 +390,11 @@ module Kml
       puts ""
       @config.install.each do |cmd|
         puts "    $ #{cmd}"
-        full_cmd = "cd #{code_path} && #{cmd}"
+        # Source mise before running command
+        full_cmd = "export PATH=\"$HOME/.local/bin:$PATH\" && eval \"$(mise activate bash)\" && cd #{code_path} && #{cmd}"
         system(
           "ssh", "-tt", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-          "bash -l -c #{Shellwords.escape(full_cmd)}"
+          "bash -c #{Shellwords.escape(full_cmd)}"
         ) or raise Error, "Install command failed: #{cmd}"
       end
     end

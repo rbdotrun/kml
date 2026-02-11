@@ -29,6 +29,16 @@ module Kml
       sandbox.ssh
     end
 
+    desc "snapshot", "Create base image snapshot for fast deploys"
+    def snapshot
+      sandbox.snapshot_create
+    end
+
+    desc "snapshot_delete", "Delete the base image snapshot"
+    def snapshot_delete
+      sandbox.snapshot_delete
+    end
+
     desc "session SUBCOMMAND ...ARGS", "Manage Claude sessions"
     subcommand "session", SessionCLI
 
