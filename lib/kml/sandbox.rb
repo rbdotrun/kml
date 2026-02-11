@@ -2,9 +2,60 @@
 
 require "shellwords"
 require "open3"
+require "stringio"
+require "faraday"
+require "faraday/multipart"
 
 module Kml
   class Sandbox
+    AUTH_WORKER_SCRIPT = <<~JS
+      function parseCookies(cookieHeader) {
+        const cookies = {};
+        if (!cookieHeader) return cookies;
+        cookieHeader.split(';').forEach(cookie => {
+          const [name, ...rest] = cookie.trim().split('=');
+          if (name) cookies[name] = rest.join('=');
+        });
+        return cookies;
+      }
+
+      export default {
+        async fetch(request, env) {
+          const url = new URL(request.url);
+          const path = url.pathname;
+
+          // Assets don't need auth - pass through
+          if (path.startsWith('/assets/') || path.startsWith('/icon')) {
+            return fetch(request);
+          }
+
+          const cookies = parseCookies(request.headers.get('Cookie') || '');
+          const tokenParam = url.searchParams.get('token');
+          const cookieToken = cookies['kml_token'];
+
+          const token = tokenParam || cookieToken;
+          if (!token || token !== env.ACCESS_TOKEN) {
+            return new Response('Not Found', { status: 404 });
+          }
+
+          // First visit with token - set cookie and redirect to clean URL
+          if (tokenParam) {
+            url.searchParams.delete('token');
+            return new Response(null, {
+              status: 302,
+              headers: {
+                'Location': url.toString(),
+                'Set-Cookie': `kml_token=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400`,
+                'Cache-Control': 'no-store'
+              }
+            });
+          }
+
+          return fetch(request);
+        }
+      };
+    JS
+
     SETUP_COMMANDS = [
       { name: "Update apt", cmd: "sudo apt-get update" },
       { name: "Configure firewall", cmd: "sudo ufw allow 22/tcp && sudo ufw --force enable" },
@@ -72,6 +123,104 @@ module Kml
 
     def remove_tunnel_route(hostname)
       update_tunnel_with_sessions
+    end
+
+    def deploy_session_worker(slug, access_token)
+      account_id = @config.cloudflare_account_id
+      api_token = @config.cloudflare_api_token
+      return unless account_id && api_token
+
+      worker_name = "kml-#{service_name}-#{slug}"
+
+      conn = Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
+        f.request :json
+        f.response :json
+        f.headers["Authorization"] = "Bearer #{api_token}"
+      end
+
+      # Upload worker script with metadata
+      metadata = {
+        main_module: "worker.js",
+        bindings: [
+          { type: "secret_text", name: "ACCESS_TOKEN", text: access_token }
+        ]
+      }
+
+      # Use multipart form for worker upload
+      conn_multipart = Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
+        f.request :multipart
+        f.response :json
+        f.headers["Authorization"] = "Bearer #{api_token}"
+      end
+
+      conn_multipart.put("accounts/#{account_id}/workers/scripts/#{worker_name}",
+        "worker.js" => Faraday::Multipart::FilePart.new(
+          StringIO.new(AUTH_WORKER_SCRIPT),
+          "application/javascript+module",
+          "worker.js"
+        ),
+        "metadata" => Faraday::Multipart::FilePart.new(
+          StringIO.new(JSON.generate(metadata)),
+          "application/json",
+          "metadata.json"
+        )
+      )
+
+      # Create route for this session's hostname
+      zone_id = @config.cloudflare_zone_id
+      domain = @config.send(:load_env_var, "CLOUDFLARE_DOMAIN")
+      return unless zone_id && domain
+
+      hostname = "#{slug}.#{domain}"
+      pattern = "#{hostname}/*"
+
+      # Check if route exists
+      response = conn.get("zones/#{zone_id}/workers/routes")
+      routes = response.body.dig("result") || []
+      existing = routes.find { |r| r["pattern"] == pattern }
+
+      if existing
+        conn.put("zones/#{zone_id}/workers/routes/#{existing['id']}", {
+          pattern: pattern,
+          script: worker_name
+        })
+      else
+        conn.post("zones/#{zone_id}/workers/routes", {
+          pattern: pattern,
+          script: worker_name
+        })
+      end
+    end
+
+    def delete_session_worker(slug)
+      account_id = @config.cloudflare_account_id
+      api_token = @config.cloudflare_api_token
+      zone_id = @config.cloudflare_zone_id
+      domain = @config.send(:load_env_var, "CLOUDFLARE_DOMAIN")
+      return unless account_id && api_token
+
+      worker_name = "kml-#{service_name}-#{slug}"
+
+      conn = Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
+        f.request :json
+        f.response :json
+        f.headers["Authorization"] = "Bearer #{api_token}"
+      end
+
+      # Delete route first
+      if zone_id && domain
+        hostname = "#{slug}.#{domain}"
+        pattern = "#{hostname}/*"
+
+        response = conn.get("zones/#{zone_id}/workers/routes")
+        routes = response.body.dig("result") || []
+        existing = routes.find { |r| r["pattern"] == pattern }
+
+        conn.delete("zones/#{zone_id}/workers/routes/#{existing['id']}") if existing
+      end
+
+      # Delete worker
+      conn.delete("accounts/#{account_id}/workers/scripts/#{worker_name}")
     end
 
     def update_tunnel_with_sessions
@@ -144,21 +293,34 @@ module Kml
     end
 
     def destroy
+      # Delete all sessions first
+      sessions = SessionStore.all
+      if sessions.any?
+        puts "Deleting #{sessions.size} session(s)..."
+        sessions.each_key do |slug|
+          print "  #{slug}..."
+          delete_session_worker(slug.to_s)
+          SessionStore.delete(slug.to_s)
+          puts " ✓"
+        end
+      end
+
       server = @hetzner.find_server(@server_name)
       tunnel = find_tunnel_by_name
-
-      if server
-        puts "Deleting server #{server['id']}..."
-        @hetzner.delete_server(server["id"])
-      else
-        puts "No server found."
-      end
 
       if tunnel
         delete_tunnel(tunnel)
         puts "✓ Tunnel deleted"
       else
         puts "No tunnel found."
+      end
+
+      if server
+        puts "Deleting server #{server['id']}..."
+        @hetzner.delete_server(server["id"])
+        puts "✓ Server deleted"
+      else
+        puts "No server found."
       end
     end
 

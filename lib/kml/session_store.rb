@@ -38,6 +38,13 @@ module Kml
         sessions[slug.to_sym].merge(slug: slug.to_s)
       end
 
+      def find_or_create(slug)
+        existing = find(slug)
+        return existing if existing
+
+        create(slug)
+      end
+
       def create(slug)
         data = load
         slug_sym = slug.to_sym
@@ -49,6 +56,7 @@ module Kml
           branch: "kml/#{slug}",
           port: data[:next_port],
           database: "app_session_#{slug.gsub('-', '_')}",
+          access_token: SecureRandom.hex(32),
           created_at: Time.now.iso8601
         }
 

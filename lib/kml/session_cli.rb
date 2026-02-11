@@ -14,7 +14,7 @@ module Kml
         raise Error, "Prompt required for -p/-j/-d modes"
       end
 
-      session_data = SessionStore.create(slug)
+      session_data = SessionStore.find_or_create(slug)
       session = build_session(session_data)
 
       session.start!(
@@ -87,6 +87,7 @@ module Kml
           branch: data[:branch],
           port: data[:port],
           database: data[:database],
+          access_token: data[:access_token],
           created_at: data[:created_at],
           sandbox: sandbox
         )
@@ -118,6 +119,7 @@ module Kml
         branch: data[:branch],
         port: data[:port],
         database: data[:database],
+        access_token: data[:access_token],
         created_at: data[:created_at],
         sandbox: sandbox
       )

@@ -5,23 +5,35 @@ require "securerandom"
 
 module Kml
   class Session
-    attr_reader :slug, :uuid, :port, :branch, :database, :created_at
+    attr_reader :slug, :uuid, :port, :branch, :database, :access_token, :created_at
 
-    def initialize(slug:, uuid: nil, port: nil, branch: nil, database: nil, created_at: nil, sandbox:)
+    def initialize(slug:, uuid: nil, port: nil, branch: nil, database: nil, access_token: nil, created_at: nil, sandbox:)
       @slug = slug
       @uuid = uuid
       @port = port
       @branch = branch
       @database = database
+      @access_token = access_token
       @created_at = created_at
       @sandbox = sandbox
     end
 
     def public_url
-      domain = @sandbox.instance_variable_get(:@config).send(:load_env_var, "CLOUDFLARE_DOMAIN")
+      domain = config.send(:load_env_var, "CLOUDFLARE_DOMAIN")
       return nil unless domain
 
       "https://#{slug}.#{domain}"
+    end
+
+    def public_url_with_token
+      url = public_url
+      return nil unless url && access_token
+
+      "#{url}?token=#{access_token}"
+    end
+
+    def config
+      @sandbox.instance_variable_get(:@config)
     end
 
     def worktree_path
@@ -60,14 +72,19 @@ module Kml
       # Add tunnel route for this session
       @sandbox.update_tunnel_with_sessions
 
+      # Deploy auth worker for this session
+      @sandbox.deploy_session_worker(slug, access_token)
+
       # Run db:prepare for the session
       @sandbox.remote_exec("cd #{worktree_path} && bin/rails db:prepare")
 
-      # Create tmux session
+      # Create tmux session with mise-enabled shell
       @sandbox.remote_exec(<<~SH)
         tmux kill-session -t #{tmux_name} 2>/dev/null || true
+        cd #{worktree_path} && overmind quit 2>/dev/null || true
+        rm -f #{worktree_path}/.overmind.sock
         tmux new-session -d -s #{tmux_name} -n app
-        tmux send-keys -t #{tmux_name}:app "cd #{worktree_path} && PORT=#{port} overmind start" Enter
+        tmux send-keys -t #{tmux_name}:app '#{mise_prefix} cd #{worktree_path} && PORT=#{port} overmind start' Enter
         tmux new-window -t #{tmux_name} -n claude
       SH
 
@@ -75,7 +92,8 @@ module Kml
       cmd = claude_cmd(prompt, new_session: true, print_mode: print_mode, json_mode: json_mode)
       @sandbox.remote_exec("tmux send-keys -t #{tmux_name}:claude #{Shellwords.escape(cmd)} Enter")
 
-      puts "Session '#{slug}' started at #{public_url}"
+      puts "Session '#{slug}' started"
+      puts "URL: #{public_url_with_token}"
 
       if detached
         puts "Use 'kml session continue #{slug}' to attach."
@@ -106,6 +124,8 @@ module Kml
       stop!
       @sandbox.remote_exec("cd #{@sandbox.code_path} && git worktree remove #{worktree_path} --force 2>/dev/null || true")
       @sandbox.remote_exec("rm -rf #{worktree_path}")
+      # Delete worker and route
+      @sandbox.delete_session_worker(slug)
       SessionStore.delete(slug)
       # Update tunnel to remove this session's route
       @sandbox.update_tunnel_with_sessions
@@ -119,9 +139,13 @@ module Kml
       env.join(" ")
     end
 
+    def mise_prefix
+      'export PATH="$HOME/.local/bin:$PATH" && eval "$(mise activate bash)" &&'
+    end
+
     def claude_cmd(prompt, new_session: false, print_mode: false, json_mode: false)
       session_flag = new_session ? "--session-id #{uuid}" : "--resume #{uuid}"
-      cmd = "cd #{worktree_path} && #{claude_env} claude #{session_flag} --dangerously-skip-permissions"
+      cmd = "#{mise_prefix} cd #{worktree_path} && #{claude_env} claude #{session_flag} --dangerously-skip-permissions"
       if print_mode || json_mode || prompt
         cmd += " -p"
         cmd += " --verbose --output-format=stream-json" if json_mode
