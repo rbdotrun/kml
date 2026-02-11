@@ -29,9 +29,13 @@ module Kml
       sandbox.ssh
     end
 
-    desc "snapshot", "Create base image snapshot for fast deploys"
-    def snapshot
-      sandbox.snapshot_create
+    desc "snapshot [SOURCE]", "Create base image snapshot (SOURCE: blank=fresh, 'sandbox'=from running sandbox)"
+    def snapshot(source = nil)
+      if source == "sandbox"
+        sandbox.snapshot_from_sandbox
+      else
+        sandbox.snapshot_create
+      end
     end
 
     desc "snapshot_delete", "Delete the base image snapshot"

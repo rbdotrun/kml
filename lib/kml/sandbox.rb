@@ -217,6 +217,33 @@ module Kml
       puts "\n✓ Snapshot '#{SNAPSHOT_NAME}' created"
     end
 
+    def snapshot_from_sandbox
+      server = @hetzner.find_server(@server_name)
+      raise Error, "No sandbox running. Use 'kml snapshot' to create from scratch." unless server
+
+      # Delete existing snapshot if any
+      existing = @hetzner.find_snapshot(SNAPSHOT_NAME)
+      if existing
+        print "Deleting existing snapshot..."
+        @hetzner.delete_snapshot(existing["id"])
+        puts " ✓"
+      end
+
+      # Create snapshot from running sandbox
+      print "Creating snapshot from sandbox..."
+      @hetzner.create_snapshot(server["id"], SNAPSHOT_NAME)
+
+      # Wait for snapshot to be ready
+      loop do
+        snap = @hetzner.find_snapshot(SNAPSHOT_NAME)
+        break if snap && snap["status"] == "available"
+        sleep 5
+      end
+      puts " ✓"
+
+      puts "\n✓ Snapshot '#{SNAPSHOT_NAME}' created from sandbox"
+    end
+
     def snapshot_delete
       snapshot = @hetzner.find_snapshot(SNAPSHOT_NAME)
       if snapshot
