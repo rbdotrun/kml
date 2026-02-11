@@ -3,6 +3,7 @@
 require_relative "kml/version"
 require_relative "kml/daytona"
 require_relative "kml/config"
+require_relative "kml/worker"
 require_relative "kml/sandbox"
 require_relative "kml/setup"
 require_relative "kml/session_store"

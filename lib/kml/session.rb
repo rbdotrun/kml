@@ -144,9 +144,21 @@ module Kml
         )
       end
 
+      # Deploy Cloudflare Worker for auth
+      print "Securing session..."
+      preview = @daytona.get_signed_preview_url(sandbox_id: @sandbox_id, port: 3000, expires_in: 86400) # 24 hours
+      worker = Worker.new(config: config, service_name: @sandbox.service_name)
+      worker.deploy(
+        slug: slug,
+        access_token: @access_token,
+        daytona_preview_url: preview["url"],
+        daytona_preview_token: preview["token"]
+      )
+      puts " done"
+
       puts ""
       puts "Session '#{slug}' ready"
-      puts "URL: #{public_url}"
+      puts "URL: #{public_url}?token=#{@access_token}"
       puts ""
       puts "Run: kml session prompt #{slug} \"your prompt\""
     end
