@@ -69,7 +69,22 @@ module Kml
         docker exec #{postgres_container} createdb -U app #{database} 2>/dev/null || true
       SH
 
-      # 3. Start app container
+      # 3. Build assets and prepare database
+      @sandbox.remote_exec(<<~SH)
+        rm -f #{worktree_path}/tmp/pids/server.pid
+        docker run --rm \
+          --network #{docker_network} \
+          -v #{worktree_path}:/rails \
+          -e RAILS_ENV=development \
+          -e POSTGRES_HOST=#{postgres_container} \
+          -e POSTGRES_DB=#{database} \
+          -e POSTGRES_USER=app \
+          -e POSTGRES_PASSWORD=sandbox123 \
+          #{docker_image} \
+          bash -c "bin/rails db:prepare && bin/rails tailwindcss:build 2>/dev/null || true"
+      SH
+
+      # 4. Start app container
       @sandbox.remote_exec(<<~SH)
         docker rm -f #{container_name} 2>/dev/null || true
         docker run -d \
@@ -84,13 +99,13 @@ module Kml
           -e POSTGRES_USER=app \
           -e POSTGRES_PASSWORD=sandbox123 \
           #{docker_image} \
-          bash -c "bin/rails db:prepare && bin/rails assets:precompile && bin/rails s -b 0.0.0.0"
+          bash -c "bin/rails s -b 0.0.0.0"
       SH
 
-      # 4. Setup tunnel ingress
+      # 5. Setup tunnel ingress
       @public_url = setup_tunnel_ingress
 
-      # 5. Create tmux session with 2 windows
+      # 6. Create tmux session with 2 windows
       @sandbox.remote_exec(<<~SH)
         tmux kill-session -t #{tmux_name} 2>/dev/null || true
         tmux new-session -d -s #{tmux_name} -n app
@@ -98,7 +113,7 @@ module Kml
         tmux new-window -t #{tmux_name} -n claude
       SH
 
-      # 6. Start Claude in tmux
+      # 7. Start Claude in tmux
       claude_cmd = build_claude_cmd(
         prompt: prompt,
         new_session: true,
@@ -178,6 +193,7 @@ module Kml
 
       puts "Restarting app container..."
       @sandbox.remote_exec(<<~SH)
+        rm -f #{worktree_path}/tmp/pids/server.pid
         docker rm -f #{container_name} 2>/dev/null || true
         docker run -d \
           --name #{container_name} \
@@ -191,7 +207,7 @@ module Kml
           -e POSTGRES_USER=app \
           -e POSTGRES_PASSWORD=sandbox123 \
           #{docker_image} \
-          bash -c "bin/rails db:prepare && bin/rails assets:precompile && bin/rails s -b 0.0.0.0"
+          bash -c "bin/rails s -b 0.0.0.0"
       SH
 
       # Also ensure tmux session exists

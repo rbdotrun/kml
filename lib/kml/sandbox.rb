@@ -134,7 +134,7 @@ module Kml
 
     # Container names
     def app_container_name
-      "#{service_name}-app"
+      "#{service_name}-web"
     end
 
     def db_container_name
@@ -143,6 +143,28 @@ module Kml
 
     def image_name
       "#{service_name}:sandbox"
+    end
+
+    def parse_procfile
+      procfile_path = "Procfile.dev"
+      return {} unless File.exist?(procfile_path)
+
+      processes = {}
+      File.readlines(procfile_path).each do |line|
+        line = line.strip
+        next if line.empty? || line.start_with?("#")
+
+        if line =~ /^([a-zA-Z0-9_-]+):\s*(.+)$/
+          name = Regexp.last_match(1)
+          command = Regexp.last_match(2)
+          processes[name] = command
+        end
+      end
+      processes
+    end
+
+    def process_container_name(process_name)
+      "#{service_name}-#{process_name}"
     end
 
     private
@@ -370,16 +392,60 @@ module Kml
         print "."
       end
 
-      # Run app
-      puts "    Starting app..."
+      # Parse Procfile.dev and run each process
+      processes = parse_procfile
+      if processes.empty?
+        # Fallback if no Procfile.dev
+        processes = { "web" => "bin/rails s -b 0.0.0.0" }
+      end
+
+      # Clean up stale pid files
       system(
         "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "docker rm -f #{app_container_name} 2>/dev/null || true"
+        "rm -f #{code_path}/tmp/pids/server.pid"
       )
+
+      # Run db:prepare
+      puts "    Running db:prepare..."
+      system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "docker run --rm " \
+        "--network #{NETWORK} " \
+        "-v #{code_path}:/rails " \
+        "-e RAILS_ENV=development " \
+        "-e POSTGRES_HOST=#{db_container_name} " \
+        "-e POSTGRES_USER=app " \
+        "-e POSTGRES_PASSWORD=#{POSTGRES_PASSWORD} " \
+        "-e POSTGRES_DB=app_sandbox " \
+        "#{image_name} " \
+        "bin/rails db:prepare"
+      )
+
+      # Build assets (CSS etc.)
+      puts "    Building assets..."
+      system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "docker run --rm " \
+        "-v #{code_path}:/rails " \
+        "-e RAILS_ENV=development " \
+        "#{image_name} " \
+        "bin/rails tailwindcss:build 2>/dev/null || true"
+      )
+
+      # Start the web process from Procfile.dev (or fallback)
+      web_command = processes["web"] || "bin/rails s -b 0.0.0.0"
+      container = process_container_name("web")
+      puts "    Starting web..."
+
+      system(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "docker rm -f #{container} 2>/dev/null || true"
+      )
+
       unless system(
         "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
         "docker run -d " \
-        "--name #{app_container_name} " \
+        "--name #{container} " \
         "--network #{NETWORK} " \
         "--restart unless-stopped " \
         "-v #{code_path}:/rails " \
@@ -391,14 +457,14 @@ module Kml
         "-e POSTGRES_PASSWORD=#{POSTGRES_PASSWORD} " \
         "-e POSTGRES_DB=app_sandbox " \
         "#{image_name} " \
-        "bash -c 'bin/rails db:prepare && bin/rails s -b 0.0.0.0'",
+        "bash -c #{Shellwords.escape(web_command)}",
         out: File::NULL
       )
-        raise Error, "Failed to start app"
+        raise Error, "Failed to start web"
       end
 
-      # Wait for app to be healthy
-      print "    Waiting for app..."
+      # Wait for web to be healthy
+      print "    Waiting for web..."
       30.times do
         sleep 2
         result = `ssh -o StrictHostKeyChecking=no deploy@#{ip} "curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/up 2>/dev/null"`.strip
