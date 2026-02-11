@@ -14,7 +14,7 @@ module Kml
       sandbox.deploy
     end
 
-    desc "destroy", "Delete all sessions and snapshot"
+    desc "destroy", "Delete all sandboxes (keeps snapshot)"
     def destroy
       sandbox.destroy
     end

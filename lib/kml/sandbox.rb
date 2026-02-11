@@ -372,17 +372,7 @@ module Kml
         end
       end
 
-      # Delete snapshot
-      snapshot = @daytona.find_snapshot_by_name(snapshot_name)
-      if snapshot
-        print "Deleting snapshot..."
-        @daytona.delete_snapshot(snapshot["id"])
-        puts " ✓"
-      else
-        puts "No snapshot found."
-      end
-
-      puts "✓ Destroyed"
+      puts "✓ All sandboxes destroyed (snapshot preserved)"
     end
 
     def snapshot_create
