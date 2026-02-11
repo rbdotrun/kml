@@ -2,6 +2,7 @@
 
 require "faraday"
 require "json"
+require "websocket-client-simple"
 
 module Kml
   class Daytona
@@ -173,19 +174,84 @@ module Kml
     end
 
     def stream_command_logs(sandbox_id:, session_id:, command_id:, &block)
-      url = "#{@endpoint}toolbox/#{sandbox_id}/toolbox/process/session/#{session_id}/command/#{command_id}/logs?follow=true"
+      # Get signed preview URL for toolbox WebSocket port (bypasses CloudFront)
+      preview = get_signed_preview_url(sandbox_id: sandbox_id, port: 2280)
+      uri = URI.parse(preview["url"])
+      ws_url = "wss://#{uri.host}/process/session/#{session_id}/command/#{command_id}/logs?follow=true"
 
-      streaming_conn = Faraday.new do |f|
-        f.headers["Authorization"] = "Bearer #{@api_key}"
-        f.options.timeout = nil  # No timeout for streaming
-        f.adapter Faraday.default_adapter
-      end
+      done = false
+      ws = WebSocket::Client::Simple.connect(ws_url, headers: {
+        "Authorization" => "Bearer #{@api_key}",
+        "X-Daytona-Preview-Token" => preview["token"],
+        "Content-Type" => "text/plain",
+        "Accept" => "text/plain"
+      })
 
-      streaming_conn.get(url) do |req|
-        req.options.on_data = proc do |chunk, _size, _env|
-          block.call(chunk) if block
+      ws.on :message do |msg|
+        if msg.type == :close
+          done = true
+        else
+          block.call(msg.data.to_s) if block && msg.data
         end
       end
+
+      ws.on :close do |_|
+        done = true
+      end
+
+      ws.on :error do |e|
+        $stderr.puts "WebSocket error: #{e}" if e
+        done = true
+      end
+
+      # Wait for completion
+      sleep 0.1 until done
+    end
+
+    def get_command_logs(sandbox_id:, session_id:, command_id:)
+      get("toolbox/#{sandbox_id}/toolbox/process/session/#{session_id}/command/#{command_id}/logs")
+    end
+
+    # Stream logs via WebSocket to sandbox's internal toolbox service (port 2280)
+    # This bypasses CloudFront and enables real-time streaming
+    def stream_command_logs(sandbox_id:, session_id:, command_id:, &block)
+      # Get signed preview URL for toolbox WebSocket port
+      preview = get_signed_preview_url(sandbox_id: sandbox_id, port: 2280)
+      preview_url = preview["url"]
+      preview_token = preview["token"]
+
+      # Convert to WebSocket URL
+      uri = URI.parse(preview_url)
+      ws_url = "#{uri.scheme == 'https' ? 'wss' : 'ws'}://#{uri.host}:#{uri.port}/process/session/#{session_id}/command/#{command_id}/logs?follow=true"
+
+      done = false
+
+      ws = WebSocket::Client::Simple.connect(ws_url, headers: {
+        "Authorization" => "Bearer #{@api_key}",
+        "X-Daytona-Preview-Token" => preview_token,
+        "Content-Type" => "text/plain",
+        "Accept" => "text/plain"
+      })
+
+      ws.on :message do |msg|
+        if msg.type == :close
+          done = true
+        else
+          block.call(msg.data.to_s) if block && msg.data
+        end
+      end
+
+      ws.on :close do |_e|
+        done = true
+      end
+
+      ws.on :error do |e|
+        $stderr.puts "WebSocket error: #{e.message}" if e
+        done = true
+      end
+
+      # Wait for completion
+      sleep 0.1 until done
     end
 
     # ============================================================

@@ -174,7 +174,7 @@ module Kml
         export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
         #{claude_env_export}
         cd #{code_path}
-        claude #{session_flag} --dangerously-skip-permissions -p --verbose --output-format=stream-json #{Shellwords.escape(prompt)} 2>&1
+        claude #{session_flag} --dangerously-skip-permissions -p --verbose --output-format=stream-json --include-partial-messages #{Shellwords.escape(prompt)} 2>&1
       SH
 
       @daytona.upload_file(
@@ -183,6 +183,7 @@ module Kml
         content: script
       )
 
+      # Execute sync and print output
       result = @daytona.execute_command(
         sandbox_id: @sandbox_id,
         command: "bash /tmp/run_claude.sh",
