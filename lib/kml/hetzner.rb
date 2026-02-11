@@ -67,26 +67,20 @@ module Kml
     def cloud_init_script(ssh_public_key)
       <<~YAML
         #cloud-config
-        package_update: true
-        packages:
-          - docker.io
-          - git
-          - jq
-          - rsync
         users:
           - name: deploy
-            groups: sudo,docker
+            groups: sudo
             shell: /bin/bash
             sudo: ALL=(ALL) NOPASSWD:ALL
             ssh_authorized_keys:
               - #{ssh_public_key}
         runcmd:
-          - curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-          - apt-get install -y nodejs
-          - npm install -g @anthropic-ai/claude-code
-          - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          - echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list
-          - apt-get update && apt-get install -y gh
+          - su - deploy -c 'curl -fsSL https://mise.run | sh'
+          - su - deploy -c '/home/deploy/.local/bin/mise settings set ruby.compile false'
+          - sed -i '1i export PATH="$HOME/.local/bin:$PATH"' /home/deploy/.bashrc
+          - sed -i '2i eval "$(/home/deploy/.local/bin/mise activate bash)"' /home/deploy/.bashrc
+          - curl -fsSL -L https://github.com/DarthSim/overmind/releases/download/v2.5.1/overmind-v2.5.1-linux-amd64.gz | gunzip > /usr/local/bin/overmind && chmod +x /usr/local/bin/overmind
+          - curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
       YAML
     end
   end

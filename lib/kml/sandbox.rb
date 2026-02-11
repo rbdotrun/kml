@@ -1,12 +1,10 @@
 # frozen_string_literal: true
 
 require "shellwords"
+require "open3"
 
 module Kml
   class Sandbox
-    NETWORK = "kml"
-    POSTGRES_PASSWORD = "sandbox123"
-
     def initialize(hetzner:, config:)
       @hetzner = hetzner
       @config = config
@@ -30,98 +28,148 @@ module Kml
 
     def remote_exec(cmd)
       ip = server_ip
-      `ssh -o StrictHostKeyChecking=no deploy@#{ip} #{Shellwords.escape(cmd)}`
+      system("ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "bash -l -c #{Shellwords.escape(cmd)}", out: File::NULL, err: File::NULL)
+    end
+
+    def remote_exec_output(cmd)
+      ip = server_ip
+      stdout, _, _ = Open3.capture3(
+        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "bash -l -c #{Shellwords.escape(cmd)}"
+      )
+      stdout.strip
     end
 
     def remote_exec_stream(cmd)
       ip = server_ip
-      system("ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}", cmd)
+      system("ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+        "bash -l -c #{Shellwords.escape(cmd)}")
     end
 
-    def anthropic_env_vars
-      api_key = ENV["ANTHROPIC_AUTH_TOKEN"] || load_env_var("ANTHROPIC_AUTH_TOKEN") ||
-                ENV["ANTHROPIC_API_KEY"] || load_env_var("ANTHROPIC_API_KEY")
-      raise Error, "ANTHROPIC_AUTH_TOKEN not set. Run 'kml init' first." unless api_key
+    def add_tunnel_route(hostname, port)
+      update_tunnel_with_sessions
+    end
 
-      base_url = ENV["ANTHROPIC_BASE_URL"] || load_env_var("ANTHROPIC_BASE_URL")
+    def remove_tunnel_route(hostname)
+      update_tunnel_with_sessions
+    end
 
-      env_vars = "ANTHROPIC_API_KEY=#{Shellwords.escape(api_key)}"
-      env_vars += " ANTHROPIC_BASE_URL=#{Shellwords.escape(base_url)}" if base_url
-      env_vars
+    def update_tunnel_with_sessions
+      tunnel = load_tunnel_from_server
+      return unless tunnel
+
+      tunnel_id = tunnel[:id]
+      return unless tunnel_id
+
+      # Build ingress from sessions only
+      ingress = []
+
+      domain = @config.send(:load_env_var, "CLOUDFLARE_DOMAIN")
+      if domain
+        SessionStore.all.each do |slug, data|
+          ingress << { hostname: "#{slug}.#{domain}", service: "http://localhost:#{data[:port]}" }
+        end
+      end
+
+      ingress << { service: "http_status:404" }
+
+      # Update tunnel
+      account_id = @config.cloudflare_account_id
+      api_token = @config.cloudflare_api_token
+      return unless account_id && api_token
+
+      conn = Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
+        f.request :json
+        f.response :json
+        f.headers["Authorization"] = "Bearer #{api_token}"
+      end
+
+      conn.put("accounts/#{account_id}/cfd_tunnel/#{tunnel_id}/configurations", {
+        config: { ingress: ingress }
+      })
+
+      # Sync DNS - add new, remove old
+      zone_id = @config.cloudflare_zone_id
+      if zone_id
+        current_hostnames = ingress.map { |r| r[:hostname] }.compact
+        sync_tunnel_dns(conn, zone_id, tunnel_id, current_hostnames)
+      end
+
+      # Restart cloudflared to pick up new config
+      restart_cloudflared
+    end
+
+    def restart_cloudflared
+      tunnel = load_tunnel_from_server
+      return unless tunnel
+
+      token = tunnel[:token]
+      return unless token
+
+      remote_exec("pkill cloudflared 2>/dev/null || true")
+      remote_exec("nohup cloudflared tunnel run --token '#{token}' > /tmp/cloudflared.log 2>&1 &")
     end
 
     def deploy
       print "[1/5] Provision server..."
       @ip = provision_or_find_server
 
-      step(2, "Sync code") { sync_code(@ip) }
-
-      if sandbox_running?(@ip)
-        puts "[3/5] App already running ✓"
-      else
-        step(3, "Build & run containers") { build_and_run(@ip) }
-      end
-
-      step(4, "Setup tunnel") { setup_tunnel(@ip) }
+      step(2, "Sync code", steps: 5) { sync_code(@ip) }
+      step(3, "Install", steps: 5) { run_install(@ip) }
+      step(4, "Start processes", steps: 5) { start_processes(@ip) }
+      step(5, "Start tunnel", steps: 5) { start_tunnel(@ip) }
 
       puts "\n✓ Sandbox ready at #{@ip}"
       @ip
     end
 
     def destroy
-      # Delete tunnel first
-      if (cf = cloudflare)
-        tunnel = cf.find_tunnel(tunnel_name)
-        if tunnel
-          puts "Deleting tunnel..."
-          cf.delete_tunnel(tunnel[:id])
-        end
-      end
-
       server = @hetzner.find_server(@server_name)
+      tunnel = find_tunnel_by_name
+
       if server
         puts "Deleting server #{server['id']}..."
         @hetzner.delete_server(server["id"])
-        puts "✓ Done"
       else
         puts "No server found."
       end
+
+      if tunnel
+        delete_tunnel(tunnel)
+        puts "✓ Tunnel deleted"
+      else
+        puts "No tunnel found."
+      end
     end
 
-    def tunnel_name
-      "kml-#{@config.service_name}-sandbox"
-    end
+    def delete_tunnel(tunnel)
+      return unless tunnel
 
-    def tunnel_id
-      return @tunnel_id if defined?(@tunnel_id)
+      tunnel_id = tunnel[:id]
 
-      cf = cloudflare
-      return nil unless cf
+      # Clean up DNS records first
+      cleanup_all_tunnel_dns(tunnel_id)
 
-      tunnel = cf.find_tunnel(tunnel_name)
-      @tunnel_id = tunnel&.dig(:id)
-    end
+      account_id = @config.cloudflare_account_id
+      api_token = @config.cloudflare_api_token
+      return unless tunnel_id && account_id && api_token
 
-    def cloudflare
-      return @cloudflare if defined?(@cloudflare)
+      conn = Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
+        f.request :json
+        f.response :json
+        f.headers["Authorization"] = "Bearer #{api_token}"
+      end
 
-      api_token = ENV["CLOUDFLARE_API_TOKEN"] || load_env_var("CLOUDFLARE_API_TOKEN")
-      account_id = ENV["CLOUDFLARE_ACCOUNT_ID"] || load_env_var("CLOUDFLARE_ACCOUNT_ID")
-      zone_id = ENV["CLOUDFLARE_ZONE_ID"] || load_env_var("CLOUDFLARE_ZONE_ID")
-      domain = ENV["CLOUDFLARE_DOMAIN"] || load_env_var("CLOUDFLARE_DOMAIN")
+      # Cleanup stale connections first
+      conn.delete("accounts/#{account_id}/cfd_tunnel/#{tunnel_id}/connections")
 
-      return nil unless api_token && account_id && zone_id && domain
-
-      @cloudflare = Cloudflare.new(
-        api_token: api_token,
-        account_id: account_id,
-        zone_id: zone_id,
-        domain: domain
-      )
+      # Delete tunnel
+      conn.delete("accounts/#{account_id}/cfd_tunnel/#{tunnel_id}")
     end
 
     def exec(command)
-      remote_exec_stream("docker exec -it #{app_container_name} #{command}")
+      remote_exec_stream("cd #{code_path} && #{command}")
     end
 
     def ssh
@@ -132,99 +180,17 @@ module Kml
       Kernel.exec("ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}")
     end
 
-    # Container names
-    def app_container_name
-      "#{service_name}-web"
-    end
-
-    def db_container_name
-      "#{service_name}-db"
-    end
-
-    def image_name
-      "#{service_name}:sandbox"
-    end
-
-    def parse_procfile
-      procfile_path = "Procfile.dev"
-      return {} unless File.exist?(procfile_path)
-
-      processes = {}
-      File.readlines(procfile_path).each do |line|
-        line = line.strip
-        next if line.empty? || line.start_with?("#")
-
-        if line =~ /^([a-zA-Z0-9_-]+):\s*(.+)$/
-          name = Regexp.last_match(1)
-          command = Regexp.last_match(2)
-          processes[name] = command
-        end
-      end
-      processes
-    end
-
-    def process_container_name(process_name)
-      "#{service_name}-#{process_name}"
+    def logs
+      remote_exec_stream("cd #{code_path} && overmind echo")
     end
 
     private
 
-    def load_env_var(name)
-      return unless File.exist?(".env")
-      File.read(".env")[/#{name}=(.+)/, 1]&.strip
-    end
-
-    def github_token
-      token = `gh auth token 2>/dev/null`.strip
-      return token unless token.empty?
-
-      token = ENV["GITHUB_TOKEN"] || ENV["GH_TOKEN"]
-      return token if token && !token.empty?
-
-      token = load_env_var("GITHUB_TOKEN") || load_env_var("GH_TOKEN")
-      return token if token && !token.empty?
-
-      token = `echo "protocol=https\nhost=github.com" | git credential fill 2>/dev/null | grep password | cut -d= -f2`.strip
-      return token unless token.empty?
-
-      nil
-    end
-
-    def git_user_name
-      name = `git config user.name 2>/dev/null`.strip
-      name.empty? ? "kml-sandbox" : name
-    end
-
-    def git_user_email
-      email = `git config user.email 2>/dev/null`.strip
-      email.empty? ? "sandbox@kml.dev" : email
-    end
-
-    def setup_ssh_key(ip)
-      key_paths = %w[~/.ssh/id_ed25519 ~/.ssh/id_rsa].map { |p| File.expand_path(p) }
-      private_key = key_paths.find { |p| File.exist?(p) }
-      return unless private_key
-
-      system(
-        "scp", "-o", "StrictHostKeyChecking=no",
-        private_key, "deploy@#{ip}:~/.ssh/",
-        out: File::NULL, err: File::NULL
-      )
-
-      key_name = File.basename(private_key)
-      system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "chmod 600 ~/.ssh/#{key_name} && ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null",
-        out: File::NULL, err: File::NULL
-      )
-    end
-
-    def step(num, name, show_done: true, steps: 5)
+    def step(num, name, steps: 4)
       print "[#{num}/#{steps}] #{name}..."
       $stdout.flush
-      result = yield
-      puts " ✓" if show_done
-      result
+      yield
+      puts " ✓"
     end
 
     def provision_or_find_server
@@ -233,7 +199,6 @@ module Kml
       if server
         ip = @hetzner.server_ip(server)
         puts " exists (#{ip})"
-        clear_known_host(ip)
         return ip
       end
 
@@ -249,17 +214,25 @@ module Kml
       ip = @hetzner.server_ip(server)
       puts " #{ip}"
 
-      clear_known_host(ip)
+      system("ssh-keygen", "-R", ip, out: File::NULL, err: File::NULL)
 
       print "    Waiting for SSH..."
       wait_for_ssh(ip)
       puts " ok"
 
-      print "    Waiting for Docker..."
-      wait_for_docker(ip)
+      print "    Waiting for cloud-init..."
+      wait_for_cloud_init(ip)
       puts " ok"
 
       ip
+    end
+
+    def wait_for_cloud_init(ip)
+      loop do
+        result = `ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no deploy@#{ip} cloud-init status 2>/dev/null`.strip
+        break if result.include?("done") || result.include?("error")
+        sleep 5
+      end
     end
 
     def wait_for_server(id)
@@ -268,10 +241,6 @@ module Kml
         return server if server && server["status"] == "running"
         sleep 3
       end
-    end
-
-    def clear_known_host(ip)
-      system("ssh-keygen", "-R", ip, out: File::NULL, err: File::NULL)
     end
 
     def wait_for_ssh(ip)
@@ -286,223 +255,219 @@ module Kml
       end
     end
 
-    def wait_for_docker(ip)
-      puts ""
-      system(
-        "ssh", "-tt", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "sudo stdbuf -oL tail -f /var/log/cloud-init-output.log | " \
-        "stdbuf -oL sed 's/^/    /' & " \
-        "PID=$!; while ! docker version >/dev/null 2>&1; do sleep 2; done; kill $PID 2>/dev/null; echo '    Docker ready'"
-      )
-    end
-
     def sync_code(ip)
-      code_path = @config.code_path
-
-      unless system(
+      system(
         "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "sudo mkdir -p #{code_path} && sudo chown deploy:deploy #{code_path}",
+        "mkdir -p #{code_path}",
         out: File::NULL
       )
-        raise Error, "Failed to create code directory"
-      end
 
-      unless system(
-        "rsync", "-az",
+      system(
+        "rsync", "-az", "--delete",
         "--exclude=tmp", "--exclude=log", "--exclude=node_modules",
         "./", "deploy@#{ip}:#{code_path}/"
-      )
-        raise Error, "Failed to sync code"
-      end
+      ) or raise Error, "Failed to sync code"
+    end
 
-      # Create directories needed by Dockerfile
-      system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "cd #{code_path} && mkdir -p log tmp storage",
-        out: File::NULL
-      )
-
-      setup_ssh_key(ip)
-
-      if (token = github_token)
+    def run_install(ip)
+      puts ""
+      @config.install.each do |cmd|
+        puts "    $ #{cmd}"
+        full_cmd = "cd #{code_path} && #{cmd}"
         system(
-          "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-          "echo #{Shellwords.escape(token)} | gh auth login --with-token 2>/dev/null || true",
-          out: File::NULL, err: File::NULL
-        )
+          "ssh", "-tt", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
+          "bash -l -c #{Shellwords.escape(full_cmd)}"
+        ) or raise Error, "Install command failed: #{cmd}"
       end
-
-      system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "git config --global user.name '#{git_user_name}' && git config --global user.email '#{git_user_email}'",
-        out: File::NULL
-      )
     end
 
-    def build_and_run(ip)
-      puts "" # newline before build output
+    def start_processes(ip)
+      # Write Procfile from config
+      procfile_content = @config.processes.map { |name, cmd| "#{name}: #{cmd}" }.join("\n")
+      File.write("/tmp/Procfile.kml", procfile_content)
+      system("scp", "-o", "StrictHostKeyChecking=no", "/tmp/Procfile.kml", "deploy@#{ip}:#{code_path}/Procfile", out: File::NULL)
 
-      # Create network
-      system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "docker network create #{NETWORK} 2>/dev/null || true",
-        out: File::NULL
-      )
+      # Stop existing overmind
+      remote_exec("cd #{code_path} && overmind quit 2>/dev/null || true")
 
-      # Build image on server
-      puts "    Building image..."
-      unless system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "cd #{code_path} && docker build -t #{image_name} ."
-      )
-        raise Error, "Docker build failed"
-      end
-
-      # Run postgres
-      puts "    Starting postgres..."
-      system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "docker rm -f #{db_container_name} 2>/dev/null || true"
-      )
-      unless system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "docker run -d " \
-        "--name #{db_container_name} " \
-        "--network #{NETWORK} " \
-        "--restart unless-stopped " \
-        "-e POSTGRES_USER=app " \
-        "-e POSTGRES_PASSWORD=#{POSTGRES_PASSWORD} " \
-        "-e POSTGRES_DB=app_sandbox " \
-        "-v #{service_name}_pgdata:/var/lib/postgresql/data " \
-        "postgres:17",
-        out: File::NULL
-      )
-        raise Error, "Failed to start postgres"
-      end
-
-      # Wait for postgres
-      print "    Waiting for postgres..."
-      10.times do
-        sleep 1
-        result = `ssh -o StrictHostKeyChecking=no deploy@#{ip} "docker exec #{db_container_name} pg_isready -U app 2>/dev/null"`.strip
-        if result.include?("accepting connections")
-          puts " ok"
-          break
-        end
-        print "."
-      end
-
-      # Parse Procfile.dev and run each process
-      processes = parse_procfile
-      if processes.empty?
-        # Fallback if no Procfile.dev
-        processes = { "web" => "bin/rails s -b 0.0.0.0" }
-      end
-
-      # Clean up stale pid files
-      system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "rm -f #{code_path}/tmp/pids/server.pid"
-      )
-
-      # Run db:prepare
-      puts "    Running db:prepare..."
-      system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "docker run --rm " \
-        "--network #{NETWORK} " \
-        "-v #{code_path}:/rails " \
-        "-e RAILS_ENV=development " \
-        "-e POSTGRES_HOST=#{db_container_name} " \
-        "-e POSTGRES_USER=app " \
-        "-e POSTGRES_PASSWORD=#{POSTGRES_PASSWORD} " \
-        "-e POSTGRES_DB=app_sandbox " \
-        "#{image_name} " \
-        "bin/rails db:prepare"
-      )
-
-      # Build assets (CSS etc.)
-      puts "    Building assets..."
-      system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "docker run --rm " \
-        "-v #{code_path}:/rails " \
-        "-e RAILS_ENV=development " \
-        "#{image_name} " \
-        "bin/rails tailwindcss:build 2>/dev/null || true"
-      )
-
-      # Start each Procfile process as a container
-      processes.each do |name, command|
-        container = process_container_name(name)
-        puts "    Starting #{name}..."
-
-        system(
-          "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-          "docker rm -f #{container} 2>/dev/null || true"
-        )
-
-        # Web process gets port mapping
-        port_mapping = name == "web" ? "-p 3000:3000 " : ""
-
-        # Use -t for pseudo-TTY (needed for watch processes)
-        unless system(
-          "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-          "docker run -d -t " \
-          "--name #{container} " \
-          "--network #{NETWORK} " \
-          "--restart unless-stopped " \
-          "-v #{code_path}:/rails " \
-          "#{port_mapping}" \
-          "-e RAILS_ENV=development " \
-          "-e RAILS_LOG_TO_STDOUT=1 " \
-          "-e POSTGRES_HOST=#{db_container_name} " \
-          "-e POSTGRES_USER=app " \
-          "-e POSTGRES_PASSWORD=#{POSTGRES_PASSWORD} " \
-          "-e POSTGRES_DB=app_sandbox " \
-          "#{image_name} " \
-          "bash -c #{Shellwords.escape(command)}",
-          out: File::NULL
-        )
-          raise Error, "Failed to start #{name}"
-        end
-      end
-
-      # Wait for web to be healthy
-      print "    Waiting for web..."
-      30.times do
-        sleep 2
-        result = `ssh -o StrictHostKeyChecking=no deploy@#{ip} "curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/up 2>/dev/null"`.strip
-        if result == "200"
-          puts " ok"
-          return
-        end
-        print "."
-      end
-      puts " timeout (app may still be starting)"
+      # Start overmind
+      remote_exec("cd #{code_path} && PORT=3000 overmind start -D")
     end
 
-    def setup_tunnel(ip)
-      cf = cloudflare
-      return unless cf
+    def start_tunnel(ip)
+      # Create or load tunnel
+      tunnel = load_or_create_tunnel
+      return unless tunnel
 
-      tunnel = cf.find_or_create_tunnel(tunnel_name)
-      token = cf.get_tunnel_token(tunnel[:id])
+      # Stop existing cloudflared
+      remote_exec("pkill cloudflared 2>/dev/null || true")
 
-      cf.put_tunnel_config(tunnel[:id], [{ "service" => "http_status:404" }])
-
-      system(
-        "ssh", "-o", "StrictHostKeyChecking=no", "deploy@#{ip}",
-        "docker rm -f cloudflared 2>/dev/null; " \
-        "docker run -d --name cloudflared --network host --restart unless-stopped " \
-        "cloudflare/cloudflared:latest tunnel --no-autoupdate run --token #{token}",
-        out: File::NULL
-      )
+      # Start cloudflared with token
+      remote_exec("nohup cloudflared tunnel run --token '#{tunnel[:token]}' > /tmp/cloudflared.log 2>&1 &")
     end
 
-    def sandbox_running?(ip)
-      output = `ssh -o StrictHostKeyChecking=no deploy@#{ip} "docker ps --filter name=#{app_container_name} -q" 2>/dev/null`.strip
-      !output.empty?
+    def load_or_create_tunnel
+      tunnel = find_tunnel_by_name
+      return tunnel if tunnel
+
+      create_tunnel
+    end
+
+    def find_tunnel_by_name
+      account_id = @config.cloudflare_account_id
+      api_token = @config.cloudflare_api_token
+      return unless account_id && api_token
+
+      tunnel_name = "#{@config.service_name}-sandbox"
+
+      conn = Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
+        f.request :json
+        f.response :json
+        f.headers["Authorization"] = "Bearer #{api_token}"
+      end
+
+      response = conn.get("accounts/#{account_id}/cfd_tunnel", { name: tunnel_name, is_deleted: false })
+      tunnels = response.body.dig("result") || []
+
+      return nil if tunnels.empty?
+
+      t = tunnels.first
+      { id: t["id"], name: t["name"], token: t["token"] }
+    end
+
+    def load_tunnel_from_server
+      output = remote_exec_output("cat /home/deploy/.kml/tunnel.json 2>/dev/null || echo '{}'")
+      tunnel = JSON.parse(output, symbolize_names: true) rescue {}
+      tunnel[:id] ? tunnel : nil
+    end
+
+    def create_tunnel
+      account_id = @config.cloudflare_account_id
+      api_token = @config.cloudflare_api_token
+      return unless account_id && api_token
+
+      conn = Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
+        f.request :json
+        f.response :json
+        f.headers["Authorization"] = "Bearer #{api_token}"
+      end
+
+      tunnel_name = "#{@config.service_name}-sandbox"
+      response = conn.post("accounts/#{account_id}/cfd_tunnel", {
+        name: tunnel_name,
+        tunnel_secret: SecureRandom.base64(32)
+      })
+
+      return unless response.body["success"]
+
+      tunnel_id = response.body.dig("result", "id")
+      token = response.body.dig("result", "token")
+
+      tunnel = { id: tunnel_id, token: token, name: tunnel_name }
+
+      # Save on server
+      remote_exec("mkdir -p /home/deploy/.kml")
+      remote_exec("cat > /home/deploy/.kml/tunnel.json << 'EOF'\n#{JSON.pretty_generate(tunnel)}\nEOF")
+
+      tunnel
+    end
+
+    def update_tunnel_ingress(tunnel_id, hostname, service)
+      account_id = @config.cloudflare_account_id
+      api_token = @config.cloudflare_api_token
+      zone_id = @config.cloudflare_zone_id
+      return unless account_id && api_token
+
+      conn = Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
+        f.request :json
+        f.response :json
+        f.headers["Authorization"] = "Bearer #{api_token}"
+      end
+
+      # Update tunnel ingress
+      conn.put("accounts/#{account_id}/cfd_tunnel/#{tunnel_id}/configurations", {
+        config: {
+          ingress: [
+            { hostname: hostname, service: service },
+            { service: "http_status:404" }
+          ]
+        }
+      })
+
+      # Create/update DNS record for the hostname
+      ensure_tunnel_dns(conn, zone_id, tunnel_id, hostname) if zone_id
+    end
+
+    def ensure_tunnel_dns(conn, zone_id, tunnel_id, hostname)
+      # Check if record exists
+      response = conn.get("zones/#{zone_id}/dns_records", { name: hostname, type: "CNAME" })
+      records = response.body.dig("result") || []
+
+      tunnel_target = "#{tunnel_id}.cfargotunnel.com"
+
+      if records.empty?
+        # Create new record
+        conn.post("zones/#{zone_id}/dns_records", {
+          type: "CNAME",
+          name: hostname,
+          content: tunnel_target,
+          proxied: true
+        })
+      else
+        # Update existing record
+        record_id = records.first["id"]
+        conn.put("zones/#{zone_id}/dns_records/#{record_id}", {
+          type: "CNAME",
+          name: hostname,
+          content: tunnel_target,
+          proxied: true
+        })
+      end
+    end
+
+    def sync_tunnel_dns(conn, zone_id, tunnel_id, current_hostnames)
+      tunnel_target = "#{tunnel_id}.cfargotunnel.com"
+      domain = @config.send(:load_env_var, "CLOUDFLARE_DOMAIN")
+
+      # Get all DNS records pointing to this tunnel
+      response = conn.get("zones/#{zone_id}/dns_records", { type: "CNAME", content: tunnel_target })
+      existing_records = response.body.dig("result") || []
+
+      # Delete records not in current_hostnames
+      existing_records.each do |record|
+        unless current_hostnames.include?(record["name"])
+          conn.delete("zones/#{zone_id}/dns_records/#{record['id']}")
+        end
+      end
+
+      # Ensure current hostnames exist
+      current_hostnames.each do |hostname|
+        ensure_tunnel_dns(conn, zone_id, tunnel_id, hostname)
+      end
+    end
+
+    def cleanup_all_tunnel_dns(tunnel_id)
+      return unless tunnel_id
+
+      account_id = @config.cloudflare_account_id
+      api_token = @config.cloudflare_api_token
+      zone_id = @config.cloudflare_zone_id
+      return unless account_id && api_token && zone_id
+
+      conn = Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
+        f.request :json
+        f.response :json
+        f.headers["Authorization"] = "Bearer #{api_token}"
+      end
+
+      # Only delete DNS records for THIS specific tunnel
+      tunnel_target = "#{tunnel_id}.cfargotunnel.com"
+      response = conn.get("zones/#{zone_id}/dns_records", { type: "CNAME", content: tunnel_target })
+      records = response.body.dig("result") || []
+
+      records.each do |record|
+        conn.delete("zones/#{zone_id}/dns_records/#{record['id']}")
+      end
     end
   end
 end

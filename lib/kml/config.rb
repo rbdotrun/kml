@@ -1,91 +1,36 @@
 # frozen_string_literal: true
 
 require "yaml"
-require "fileutils"
 
 module Kml
   class Config
-    KAMAL_CONFIG = "config/deploy.yml"
-    SANDBOX_CONFIG = "config/deploy.sandbox.yml"
-    SANDBOX_SECRETS = ".kamal/secrets.sandbox"
+    KML_CONFIG = ".kml.yml"
+    KAMAL_SECRETS = ".kamal/secrets"
+    KAMAL_TUNNEL_CONFIG = ".kamal/tunnel/config.yml"
 
-    attr_reader :production_config, :sandbox_config
+    attr_reader :install, :processes
 
     def initialize(root: Dir.pwd)
       @root = root
-      @production_config = load_yaml(File.join(root, KAMAL_CONFIG))
-    end
-
-    def generate_sandbox(ip:)
-      service_name = "#{@production_config['service']}-sandbox"
-
-      @sandbox_config = {
-        "service" => service_name,
-        "image" => @production_config["image"],
-        "servers" => {
-          "web" => {
-            "hosts" => [ip],
-            "cmd" => sandbox_cmd,
-            "options" => {
-              "volume" => "/opt/#{@production_config['service']}:/rails"
-            }
-          }
-        },
-        "registry" => { "server" => "localhost:5001" },
-        "proxy" => {
-          "ssl" => false,
-          "app_port" => 3000,
-          "healthcheck" => {
-            "path" => "/up",
-            "interval" => 5,
-            "timeout" => 60
-          }
-        },
-        "builder" => { "arch" => "amd64" },
-        "ssh" => { "user" => "deploy" },
-        "env" => sandbox_env(ip),
-        "volumes" => ["#{service_name.tr('-', '_')}_storage:/rails/storage"],
-        "accessories" => sandbox_accessories(ip)
-      }
-    end
-
-    def write_sandbox_config
-      path = File.join(@root, SANDBOX_CONFIG)
-      File.write(path, @sandbox_config.to_yaml)
-      path
-    end
-
-    def write_sandbox_secrets
-      FileUtils.mkdir_p(File.join(@root, ".kamal"))
-      path = File.join(@root, SANDBOX_SECRETS)
-      content = <<~SECRETS
-        RAILS_MASTER_KEY=$(cat config/master.key)
-        POSTGRES_PASSWORD=sandbox123
-      SECRETS
-      File.write(path, content)
-      path
+      config = load_yaml(File.join(root, KML_CONFIG))
+      @install = config["install"] || []
+      @processes = config["processes"] || {}
+      @service_name = File.basename(root)
     end
 
     def service_name
-      @production_config["service"]
+      @service_name
     end
 
     def code_path
-      "/opt/#{service_name}"
-    end
-
-    def ssh_keys
-      # Kamal config can specify ssh.keys as array of key paths
-      keys = @production_config.dig("ssh", "keys") || []
-      keys = [keys] unless keys.is_a?(Array)
-      keys.map { |k| File.expand_path(k) }
+      "/home/deploy/app"
     end
 
     def ssh_public_key
-      # Try keys from Kamal config first, then default
-      key_paths = ssh_keys.map { |k| "#{k}.pub" }
-      key_paths << File.expand_path("~/.ssh/id_rsa.pub")
-      key_paths << File.expand_path("~/.ssh/id_ed25519.pub")
+      key_paths = [
+        File.expand_path("~/.ssh/id_ed25519.pub"),
+        File.expand_path("~/.ssh/id_rsa.pub")
+      ]
 
       key_path = key_paths.find { |p| File.exist?(p) }
       raise Error, "No SSH public key found" unless key_path
@@ -93,51 +38,66 @@ module Kml
       File.read(key_path).strip
     end
 
+    def tunnel_token
+      # Check .env first, then .kamal/secrets
+      load_env_var("TUNNEL_TOKEN") || load_kamal_secret("TUNNEL_TOKEN")
+    end
+
+    def tunnel_hostname
+      domain = load_env_var("CLOUDFLARE_DOMAIN")
+      return nil unless domain
+
+      "#{service_name}-sandbox.#{domain}"
+    end
+
+    def tunnel_id
+      path = File.join(@root, KAMAL_TUNNEL_CONFIG)
+      return nil unless File.exist?(path)
+
+      config = YAML.load_file(path)
+      config["tunnel"]
+    end
+
+    def tunnel_credentials
+      path = File.join(@root, ".kamal/tunnel/credentials.json")
+      return nil unless File.exist?(path)
+
+      File.read(path)
+    end
+
+    def cloudflare_account_id
+      load_env_var("CLOUDFLARE_ACCOUNT_ID")
+    end
+
+    def cloudflare_api_token
+      load_env_var("CLOUDFLARE_API_TOKEN")
+    end
+
+    def cloudflare_zone_id
+      load_env_var("CLOUDFLARE_ZONE_ID")
+    end
+
     private
 
     def load_yaml(path)
-      YAML.load_file(path, aliases: true)
-    rescue Psych::AliasesNotEnabled
+      raise Error, "#{KML_CONFIG} not found" unless File.exist?(path)
       YAML.load_file(path)
     end
 
-    def sandbox_cmd
-      db_host = "#{@production_config['service']}-sandbox-db"
-      "bash -c 'while ! pg_isready -h #{db_host} -q; do sleep 1; done && bin/rails db:prepare && bin/rails server -b 0.0.0.0 -p 3000'"
+    def load_env_var(name)
+      return ENV[name] if ENV[name] && !ENV[name].empty?
+
+      env_path = File.join(@root, ".env")
+      return nil unless File.exist?(env_path)
+
+      File.read(env_path)[/^#{name}=(.+)$/, 1]&.strip
     end
 
-    def sandbox_env(ip)
-      db_host = "#{@production_config['service']}-sandbox-db"
-      {
-        "clear" => {
-          "RAILS_ENV" => "development",
-          "RAILS_LOG_TO_STDOUT" => "1",
-          "SOLID_QUEUE_IN_PUMA" => "",
-          "POSTGRES_HOST" => db_host,
-          "POSTGRES_USER" => "app",
-          "POSTGRES_DB" => "app_sandbox",
-          "POSTGRES_PORT" => "5432"
-        },
-        "secret" => %w[RAILS_MASTER_KEY POSTGRES_PASSWORD]
-      }
-    end
+    def load_kamal_secret(name)
+      path = File.join(@root, KAMAL_SECRETS)
+      return nil unless File.exist?(path)
 
-    def sandbox_accessories(ip)
-      {
-        "db" => {
-          "image" => "postgres:17",
-          "host" => ip,
-          "port" => "5432:5432",
-          "env" => {
-            "clear" => {
-              "POSTGRES_USER" => "app",
-              "POSTGRES_DB" => "app_sandbox"
-            },
-            "secret" => ["POSTGRES_PASSWORD"]
-          },
-          "directories" => ["sandbox_data:/var/lib/postgresql/data"]
-        }
-      }
+      File.read(path)[/^#{name}=(.+)$/, 1]&.strip
     end
   end
 end

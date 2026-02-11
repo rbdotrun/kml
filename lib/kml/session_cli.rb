@@ -30,12 +30,13 @@ module Kml
 
     desc "continue SLUG [PROMPT]", "Continue existing session"
     option :detached, aliases: "-d", type: :boolean, desc: "Run in background"
+    option :json, aliases: "-j", type: :boolean, desc: "JSON output mode"
     def continue(slug, prompt = nil)
       session_data = SessionStore.find(slug)
       raise Error, "Session '#{slug}' not found" unless session_data
 
       session = build_session(session_data)
-      session.continue!(prompt: prompt, detached: options[:detached])
+      session.continue!(prompt: prompt, detached: options[:detached], json_mode: options[:json])
     rescue Error => e
       puts "Error: #{e.message}"
       exit 1
