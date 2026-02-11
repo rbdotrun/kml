@@ -9,36 +9,22 @@ module Kml
       Setup.new.run
     end
 
-    desc "deploy", "Provision server and deploy sandbox"
+    desc "deploy", "Create Daytona snapshot for sandbox"
     def deploy
       sandbox.deploy
     end
 
-    desc "destroy", "Teardown sandbox server"
+    desc "destroy", "Delete all sessions and snapshot"
     def destroy
       sandbox.destroy
     end
 
-    desc "exec COMMAND", "Execute command in sandbox container"
-    def exec(command)
-      sandbox.exec(command)
+    desc "snapshot", "Create/rebuild the base snapshot"
+    def snapshot
+      sandbox.snapshot_create
     end
 
-    desc "ssh", "SSH into sandbox server"
-    def ssh
-      sandbox.ssh
-    end
-
-    desc "snapshot [SERVER]", "Create base image snapshot (SERVER: blank=fresh, or server name to snapshot)"
-    def snapshot(server_name = nil)
-      if server_name
-        sandbox.snapshot_from_server(server_name)
-      else
-        sandbox.snapshot_create
-      end
-    end
-
-    desc "snapshot_delete", "Delete the base image snapshot"
+    desc "snapshot_delete", "Delete the base snapshot"
     def snapshot_delete
       sandbox.snapshot_delete
     end
@@ -49,12 +35,12 @@ module Kml
     private
 
     def sandbox
-      token = ENV.fetch("HETZNER_API_TOKEN") { load_env_var("HETZNER_API_TOKEN") }
-      raise Error, "HETZNER_API_TOKEN not set. Run 'kml init' first." unless token
+      api_key = ENV.fetch("DAYTONA_API_KEY") { load_env_var("DAYTONA_API_KEY") }
+      raise Error, "DAYTONA_API_KEY not set. Run 'kml init' or set in .env" unless api_key
 
-      hetzner = Hetzner.new(token: token)
+      daytona = Daytona.new(api_key: api_key)
       config = Config.new
-      Sandbox.new(hetzner: hetzner, config: config)
+      Sandbox.new(daytona: daytona, config: config)
     end
 
     def load_env_var(name)

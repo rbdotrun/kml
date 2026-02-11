@@ -6,6 +6,7 @@ module Kml
   class Setup
     ENV_FILE = ".env"
     DEFAULT_ANTHROPIC_URL = "https://api.anthropic.com"
+    DEFAULT_DAYTONA_ENDPOINT = "https://app.daytona.io/api"
 
     def run
       puts "kml setup"
@@ -14,12 +15,12 @@ module Kml
 
       credentials = {}
 
-      # Hetzner
-      credentials[:hetzner] = prompt_credential(
-        name: "HETZNER_API_TOKEN",
-        description: "Hetzner Cloud API token",
-        help_url: "https://console.hetzner.cloud → Security → API Tokens",
-        validator: ->(token) { validate_hetzner(token) }
+      # Daytona
+      credentials[:daytona] = prompt_credential(
+        name: "DAYTONA_API_KEY",
+        description: "Daytona API key",
+        help_url: "https://app.daytona.io/dashboard/keys",
+        validator: ->(token) { validate_daytona(token) }
       )
 
       # Anthropic endpoint (ask first, needed for validation)
@@ -54,6 +55,40 @@ module Kml
         )
       end
 
+      # Cloudflare (for custom domain auth)
+      puts
+      puts "Cloudflare settings (for custom domain auth):"
+      credentials[:cf_account] = prompt_value(
+        name: "CLOUDFLARE_ACCOUNT_ID",
+        description: "Cloudflare Account ID",
+        default: "",
+        help: "Find in Cloudflare dashboard → Overview → Account ID"
+      )
+
+      if credentials[:cf_account] && !credentials[:cf_account].empty?
+        credentials[:cf_token] = prompt_credential(
+          name: "CLOUDFLARE_API_TOKEN",
+          description: "Cloudflare API token (Workers + DNS permissions)",
+          help_url: "https://dash.cloudflare.com/profile/api-tokens",
+          validator: ->(token) { validate_cloudflare(token, credentials[:cf_account]) },
+          optional: true
+        )
+
+        credentials[:cf_zone] = prompt_value(
+          name: "CLOUDFLARE_ZONE_ID",
+          description: "Cloudflare Zone ID",
+          default: "",
+          help: "Find in Cloudflare dashboard → Domain → Overview → Zone ID"
+        )
+
+        credentials[:cf_domain] = prompt_value(
+          name: "CLOUDFLARE_DOMAIN",
+          description: "Domain for session URLs",
+          default: "",
+          help: "e.g. rb.run (sessions will be slug.rb.run)"
+        )
+      end
+
       puts
       write_env_file(credentials)
       puts
@@ -68,18 +103,22 @@ module Kml
       puts "#{description}"
       puts "  #{help}"
 
-      if existing && existing != default
+      if existing && !existing.empty? && existing != default
         print "  Current: #{existing} - keep? [Y/n] "
         answer = $stdin.gets&.strip&.downcase
         return existing if answer.empty? || answer == "y"
       end
 
-      print "  #{name} [#{default}]: "
+      print "  #{name}#{default.empty? ? '' : " [#{default}]"}: "
       value = $stdin.gets&.strip
 
       if value.nil? || value.empty?
-        puts "  Using default: #{default}"
-        return default
+        if default.empty?
+          return nil
+        else
+          puts "  Using default: #{default}"
+          return default
+        end
       end
 
       value
@@ -156,15 +195,15 @@ module Kml
       token.empty? ? nil : token
     end
 
-    def validate_hetzner(token)
+    def validate_daytona(token)
       return false if token.nil? || token.empty?
 
-      conn = Faraday.new(url: "https://api.hetzner.cloud/v1") do |f|
+      conn = Faraday.new(url: DEFAULT_DAYTONA_ENDPOINT) do |f|
         f.response :json
         f.headers["Authorization"] = "Bearer #{token}"
       end
 
-      response = conn.get("servers", { per_page: 1 })
+      response = conn.get("snapshots", { limit: 1 })
       response.status == 200
     rescue
       false
@@ -211,19 +250,37 @@ module Kml
       false
     end
 
+    def validate_cloudflare(token, account_id)
+      return false if token.nil? || token.empty?
+
+      conn = Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
+        f.response :json
+        f.headers["Authorization"] = "Bearer #{token}"
+      end
+
+      response = conn.get("accounts/#{account_id}")
+      response.status == 200
+    rescue
+      false
+    end
+
     def write_env_file(credentials)
       existing = File.exist?(ENV_FILE) ? File.read(ENV_FILE) : ""
       lines = existing.lines.map(&:chomp)
 
       updates = {
-        "HETZNER_API_TOKEN" => credentials[:hetzner],
+        "DAYTONA_API_KEY" => credentials[:daytona],
         "ANTHROPIC_BASE_URL" => credentials[:anthropic_url],
         "ANTHROPIC_AUTH_TOKEN" => credentials[:anthropic],
-        "GITHUB_TOKEN" => credentials[:github]
+        "GITHUB_TOKEN" => credentials[:github],
+        "CLOUDFLARE_ACCOUNT_ID" => credentials[:cf_account],
+        "CLOUDFLARE_API_TOKEN" => credentials[:cf_token],
+        "CLOUDFLARE_ZONE_ID" => credentials[:cf_zone],
+        "CLOUDFLARE_DOMAIN" => credentials[:cf_domain]
       }.compact
 
       updates.each do |key, value|
-        next unless value
+        next unless value && !value.empty?
 
         idx = lines.find_index { |l| l.start_with?("#{key}=") }
         if idx

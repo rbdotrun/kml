@@ -7,7 +7,6 @@ module Kml
   class SessionStore
     STORE_DIR = ".kml"
     STORE_FILE = "sessions.json"
-    STARTING_PORT = 3001
 
     class << self
       def path
@@ -53,18 +52,25 @@ module Kml
 
         session = {
           uuid: SecureRandom.uuid,
-          branch: "kml/#{slug}",
-          port: data[:next_port],
-          database: "app_session_#{slug.gsub('-', '_')}",
+          sandbox_id: nil,  # Set when sandbox is created
           access_token: SecureRandom.hex(32),
           created_at: Time.now.iso8601
         }
 
         data[:sessions][slug_sym] = session
-        data[:next_port] += 1
         save(data)
 
         session.merge(slug: slug)
+      end
+
+      def update(slug, **attrs)
+        data = load
+        slug_sym = slug.to_sym
+
+        return unless data[:sessions][slug_sym]
+
+        data[:sessions][slug_sym].merge!(attrs)
+        save(data)
       end
 
       def delete(slug)
@@ -76,7 +82,7 @@ module Kml
       private
 
       def default_data
-        { sessions: {}, next_port: STARTING_PORT }
+        { sessions: {} }
       end
     end
   end

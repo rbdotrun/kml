@@ -42,14 +42,13 @@ module Kml
       exit 1
     end
 
-    desc "stop SLUG", "Stop session (keep worktree)"
+    desc "stop SLUG", "Stop session (keep sandbox)"
     def stop(slug)
       session_data = SessionStore.find(slug)
       raise Error, "Session '#{slug}' not found" unless session_data
 
       session = build_session(session_data)
       session.stop!
-      puts "Session '#{slug}' stopped."
     rescue Error => e
       puts "Error: #{e.message}"
       exit 1
@@ -76,24 +75,27 @@ module Kml
         return
       end
 
-      sandbox = build_sandbox
-      puts format("%-20s %-10s %s", "SLUG", "STATUS", "URL")
+      daytona, sandbox = build_daytona_and_sandbox
+
+      puts format("%-20s %-10s %s", "SLUG", "STATUS", "SANDBOX")
       puts "-" * 70
 
       sessions.each do |slug, data|
-        session = Session.new(
-          slug: slug.to_s,
-          uuid: data[:uuid],
-          branch: data[:branch],
-          port: data[:port],
-          database: data[:database],
-          access_token: data[:access_token],
-          created_at: data[:created_at],
-          sandbox: sandbox
-        )
-        status = session.running? ? "running" : "stopped"
-        url = session.public_url || "port:#{data[:port]}"
-        puts format("%-20s %-10s %s", slug, status, url)
+        status = "unknown"
+        sandbox_id = data[:sandbox_id] || "-"
+
+        if data[:sandbox_id]
+          begin
+            sb = daytona.get_sandbox(data[:sandbox_id])
+            status = sb["state"] || "unknown"
+          rescue
+            status = "deleted?"
+          end
+        else
+          status = "not started"
+        end
+
+        puts format("%-20s %-10s %s", slug, status, sandbox_id)
       end
     rescue Error => e
       puts "Error: #{e.message}"
@@ -102,26 +104,28 @@ module Kml
 
     private
 
-    def build_sandbox
-      token = ENV.fetch("HETZNER_API_TOKEN") { load_env_var("HETZNER_API_TOKEN") }
-      raise Error, "HETZNER_API_TOKEN not set. Run 'kml init' first." unless token
+    def build_daytona_and_sandbox
+      api_key = ENV.fetch("DAYTONA_API_KEY") { load_env_var("DAYTONA_API_KEY") }
+      raise Error, "DAYTONA_API_KEY not set" unless api_key
 
-      hetzner = Hetzner.new(token: token)
+      daytona = Daytona.new(api_key: api_key)
       config = Config.new
-      Sandbox.new(hetzner: hetzner, config: config)
+      sandbox = Sandbox.new(daytona: daytona, config: config)
+
+      [daytona, sandbox]
     end
 
     def build_session(data)
-      sandbox = build_sandbox
+      daytona, sandbox = build_daytona_and_sandbox
+
       Session.new(
         slug: data[:slug],
         uuid: data[:uuid],
-        branch: data[:branch],
-        port: data[:port],
-        database: data[:database],
+        sandbox_id: data[:sandbox_id],
         access_token: data[:access_token],
         created_at: data[:created_at],
-        sandbox: sandbox
+        sandbox: sandbox,
+        daytona: daytona
       )
     end
 
