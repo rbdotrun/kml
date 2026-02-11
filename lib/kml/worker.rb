@@ -108,6 +108,11 @@ module Kml
         existing = routes.find { |r| r["pattern"] == pattern }
 
         conn.delete("zones/#{zone_id}/workers/routes/#{existing['id']}") if existing
+
+        # Delete DNS record
+        response = conn.get("zones/#{zone_id}/dns_records", { name: hostname, type: "CNAME" })
+        records = response.body.dig("result") || []
+        records.each { |r| conn.delete("zones/#{zone_id}/dns_records/#{r['id']}") }
       end
 
       # Delete worker
