@@ -212,46 +212,79 @@ module Kml
       get("toolbox/#{sandbox_id}/toolbox/process/session/#{session_id}/command/#{command_id}/logs")
     end
 
-    # Stream logs via WebSocket to sandbox's internal toolbox service (port 2280)
-    # This bypasses CloudFront and enables real-time streaming
-    def stream_command_logs(sandbox_id:, session_id:, command_id:, &block)
-      # Get signed preview URL for toolbox WebSocket port
-      preview = get_signed_preview_url(sandbox_id: sandbox_id, port: 2280)
-      preview_url = preview["url"]
-      preview_token = preview["token"]
+    # ============================================================
+    # TOOLBOX - PTY
+    # ============================================================
 
-      # Convert to WebSocket URL
-      uri = URI.parse(preview_url)
-      ws_url = "#{uri.scheme == 'https' ? 'wss' : 'ws'}://#{uri.host}:#{uri.port}/process/session/#{session_id}/command/#{command_id}/logs?follow=true"
+    def create_pty_session(sandbox_id:, session_id:, cwd: nil)
+      post("toolbox/#{sandbox_id}/toolbox/process/pty", {
+        id: session_id,
+        cwd: cwd,
+        lazyStart: true
+      }.compact)
+    end
+
+    def run_pty_command(sandbox_id:, command:, timeout: 600, cwd: nil, &block)
+      pty_id = "pty-#{SecureRandom.hex(8)}"
+      create_pty_session(sandbox_id: sandbox_id, session_id: pty_id, cwd: cwd)
+
+      preview = get_signed_preview_url(sandbox_id: sandbox_id, port: 2280)
+      ws_url = "wss://#{URI.parse(preview["url"]).host}/process/pty/#{pty_id}/connect"
 
       done = false
+      connected = false
+      command_sent = false
+      saw_result = false
+      start_time = Time.now
 
       ws = WebSocket::Client::Simple.connect(ws_url, headers: {
         "Authorization" => "Bearer #{@api_key}",
-        "X-Daytona-Preview-Token" => preview_token,
-        "Content-Type" => "text/plain",
-        "Accept" => "text/plain"
+        "X-Daytona-Preview-Token" => preview["token"]
       })
 
       ws.on :message do |msg|
+        data = msg.data.to_s
+
+        # Check for control message
+        if data.include?('"type":"control"') && data.include?("connected")
+          connected = true
+          # Send command immediately after connection
+          ws.send("#{command}\n")
+          command_sent = true
+          next
+        end
+
         if msg.type == :close
           done = true
-        else
-          block.call(msg.data.to_s) if block && msg.data
+        elsif command_sent
+          # Stream output
+          block.call(data) if block
+
+          # Check for result JSON (command complete)
+          if data.include?('"type":"result"')
+            saw_result = true
+          end
+
+          # Done when we see result and then a new prompt
+          if saw_result && data.include?("$ ")
+            done = true
+          end
         end
       end
 
-      ws.on :close do |_e|
+      ws.on :close do |_|
         done = true
       end
 
-      ws.on :error do |e|
-        $stderr.puts "WebSocket error: #{e.message}" if e
+      ws.on :error do |_e|
         done = true
       end
 
-      # Wait for completion
-      sleep 0.1 until done
+      until done || (Time.now - start_time > timeout)
+        sleep 0.05
+      end
+
+      ws.close rescue nil
     end
 
     # ============================================================

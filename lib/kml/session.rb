@@ -177,20 +177,39 @@ module Kml
         claude #{session_flag} --dangerously-skip-permissions -p --verbose --output-format=stream-json --include-partial-messages #{Shellwords.escape(prompt)} 2>&1
       SH
 
-      @daytona.upload_file(
-        sandbox_id: @sandbox_id,
-        path: "/tmp/run_claude.sh",
-        content: script
-      )
+      # Build command (no script file needed for PTY)
+      env_exports = claude_env_export
+      env_part = env_exports.empty? ? "" : "#{env_exports} &&"
+      cmd = "export PATH=\"$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH\" && #{env_part} cd #{code_path} && claude #{session_flag} --dangerously-skip-permissions -p --verbose --output-format=stream-json --include-partial-messages #{Shellwords.escape(prompt)}"
 
-      # Execute sync and print output
-      result = @daytona.execute_command(
+      # Stream via PTY for real-time output
+      output_started = false
+      buffer = ""
+      @daytona.run_pty_command(
         sandbox_id: @sandbox_id,
-        command: "bash /tmp/run_claude.sh",
+        command: cmd,
         timeout: 600
-      )
-
-      puts result["result"]
+      ) do |chunk|
+        # Skip until we see JSON output (filters command echo)
+        if !output_started
+          output_started = true if chunk.include?('{"type":')
+          next unless output_started
+        end
+        # Strip ANSI codes and buffer
+        clean = chunk.gsub(/\e\[[0-9;]*[a-zA-Z]/, '').gsub(/\e\][^\a]*\a/, '')
+        buffer += clean
+        # Emit complete JSON lines
+        while (idx = buffer.index("\n"))
+          line = buffer.slice!(0, idx + 1).strip
+          next if line.empty?
+          begin
+            JSON.parse(line)
+            puts line
+            $stdout.flush
+          rescue JSON::ParserError
+          end
+        end
+      end
     end
 
     def conversations
@@ -244,7 +263,7 @@ module Kml
       lines = []
       lines << "export ANTHROPIC_AUTH_TOKEN=#{config.send(:load_env_var, 'ANTHROPIC_AUTH_TOKEN')}" if config.send(:load_env_var, 'ANTHROPIC_AUTH_TOKEN')
       lines << "export ANTHROPIC_BASE_URL=#{config.send(:load_env_var, 'ANTHROPIC_BASE_URL')}" if config.send(:load_env_var, 'ANTHROPIC_BASE_URL')
-      lines.join("\n")
+      lines.join(" && ")
     end
 
     def git_remote_url
