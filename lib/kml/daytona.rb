@@ -76,6 +76,15 @@ module Kml
       get("sandbox/#{id}")
     end
 
+    def list_sandboxes
+      get("sandbox")
+    end
+
+    def find_sandbox_by_name(name)
+      sandboxes = list_sandboxes
+      sandboxes&.find { |s| s["name"] == name }
+    end
+
     def start_sandbox(id)
       post("sandbox/#{id}/start")
     end
@@ -134,6 +143,49 @@ module Kml
         cwd: cwd,
         timeout: timeout
       }.compact)
+    end
+
+    # ============================================================
+    # TOOLBOX - SESSIONS (Background Processes)
+    # ============================================================
+
+    def create_session(sandbox_id:, session_id:)
+      post("toolbox/#{sandbox_id}/toolbox/process/session", { sessionId: session_id })
+    end
+
+    def get_session(sandbox_id:, session_id:)
+      get("toolbox/#{sandbox_id}/toolbox/process/session/#{session_id}")
+    end
+
+    def list_sessions(sandbox_id:)
+      get("toolbox/#{sandbox_id}/toolbox/process/session")
+    end
+
+    def delete_session(sandbox_id:, session_id:)
+      delete("toolbox/#{sandbox_id}/toolbox/process/session/#{session_id}")
+    end
+
+    def session_execute(sandbox_id:, session_id:, command:, run_async: true)
+      post("toolbox/#{sandbox_id}/toolbox/process/session/#{session_id}/exec", {
+        command: command,
+        runAsync: run_async
+      })
+    end
+
+    def stream_command_logs(sandbox_id:, session_id:, command_id:, &block)
+      url = "#{@endpoint}toolbox/#{sandbox_id}/toolbox/process/session/#{session_id}/command/#{command_id}/logs?follow=true"
+
+      streaming_conn = Faraday.new do |f|
+        f.headers["Authorization"] = "Bearer #{@api_key}"
+        f.options.timeout = nil  # No timeout for streaming
+        f.adapter Faraday.default_adapter
+      end
+
+      streaming_conn.get(url) do |req|
+        req.options.on_data = proc do |chunk, _size, _env|
+          block.call(chunk) if block
+        end
+      end
     end
 
     # ============================================================

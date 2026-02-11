@@ -37,13 +37,6 @@ module Kml
         sessions[slug.to_sym].merge(slug: slug.to_s)
       end
 
-      def find_or_create(slug)
-        existing = find(slug)
-        return existing if existing
-
-        create(slug)
-      end
-
       def create(slug)
         data = load
         slug_sym = slug.to_sym
@@ -51,10 +44,10 @@ module Kml
         raise Error, "Session '#{slug}' already exists" if data[:sessions][slug_sym]
 
         session = {
-          uuid: SecureRandom.uuid,
-          sandbox_id: nil,  # Set when sandbox is created
+          sandbox_id: nil,
           access_token: SecureRandom.hex(32),
-          created_at: Time.now.iso8601
+          created_at: Time.now.iso8601,
+          conversations: []
         }
 
         data[:sessions][slug_sym] = session
@@ -71,6 +64,41 @@ module Kml
 
         data[:sessions][slug_sym].merge!(attrs)
         save(data)
+      end
+
+      def add_conversation(slug, uuid:, prompt:)
+        data = load
+        slug_sym = slug.to_sym
+
+        return unless data[:sessions][slug_sym]
+
+        data[:sessions][slug_sym][:conversations] ||= []
+        data[:sessions][slug_sym][:conversations] << {
+          uuid: uuid,
+          created_at: Time.now.iso8601,
+          last_prompt: prompt[0..50]
+        }
+        save(data)
+      end
+
+      def update_conversation(slug, uuid:, prompt:)
+        data = load
+        slug_sym = slug.to_sym
+
+        return unless data[:sessions][slug_sym]
+
+        conv = data[:sessions][slug_sym][:conversations]&.find { |c| c[:uuid] == uuid }
+        if conv
+          conv[:last_prompt] = prompt[0..50]
+          save(data)
+        end
+      end
+
+      def conversations(slug)
+        session = find(slug)
+        return [] unless session
+
+        session[:conversations] || []
       end
 
       def delete(slug)

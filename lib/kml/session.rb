@@ -5,11 +5,10 @@ require "securerandom"
 
 module Kml
   class Session
-    attr_reader :slug, :uuid, :sandbox_id, :access_token, :created_at
+    attr_reader :slug, :sandbox_id, :access_token, :created_at
 
-    def initialize(slug:, uuid: nil, sandbox_id: nil, access_token: nil, created_at: nil, sandbox:, daytona:)
+    def initialize(slug:, sandbox_id: nil, access_token: nil, created_at: nil, sandbox:, daytona:)
       @slug = slug
-      @uuid = uuid
       @sandbox_id = sandbox_id
       @access_token = access_token
       @created_at = created_at
@@ -22,13 +21,6 @@ module Kml
       return nil unless domain
 
       "https://#{slug}.#{domain}"
-    end
-
-    def public_url_with_token
-      url = public_url
-      return nil unless url && access_token
-
-      "#{url}?token=#{access_token}"
     end
 
     def config
@@ -50,55 +42,59 @@ module Kml
       end
     end
 
-    def start!(prompt: nil, detached: false, print_mode: false, json_mode: false)
-      if (detached || print_mode || json_mode) && prompt.nil?
-        raise Error, "Prompt required for detached/print/json mode"
+    # Create sandbox only (no Claude)
+    def start!
+      sandbox_name = "kml-#{@sandbox.service_name}-#{slug}"
+
+      existing = @daytona.find_sandbox_by_name(sandbox_name)
+      if existing
+        print "Found existing sandbox, deleting..."
+        begin
+          @daytona.delete_sandbox(existing["id"])
+          sleep 2
+        rescue
+        end
+        puts " done"
       end
 
       puts "Creating Daytona sandbox..."
 
-      # Create sandbox from snapshot
       sandbox_result = @daytona.create_sandbox(
         snapshot: @sandbox.snapshot_name,
-        name: "kml-#{@sandbox.service_name}-#{slug}",
-        auto_stop_interval: 0,  # Don't auto-stop
+        name: sandbox_name,
+        auto_stop_interval: 0,
         public: false
       )
 
       @sandbox_id = sandbox_result["id"]
-
-      # Update session store with sandbox_id
       SessionStore.update(slug, sandbox_id: @sandbox_id)
 
-      # Wait for sandbox to be ready
       print "Waiting for sandbox..."
       @daytona.wait_for_sandbox(@sandbox_id)
       puts " ready"
 
-      # Clone the repo
+      # Clone repo
       print "Cloning repository..."
       repo_url = config.send(:load_env_var, "GIT_REPO_URL") || git_remote_url
       if repo_url
+        repo_url = ssh_to_https(repo_url)
+        github_token = config.send(:load_env_var, "GITHUB_TOKEN")
+
         @daytona.git_clone(
           sandbox_id: @sandbox_id,
           url: repo_url,
-          path: code_path
+          path: code_path,
+          username: github_token ? "x-access-token" : nil,
+          password: github_token
         )
         puts " done"
       else
-        # Upload current directory via rsync-like approach
-        puts " (using local files)"
-        upload_local_code
+        puts " (no repo)"
       end
 
-      # Get preview URL and token
-      preview = @daytona.get_preview_url(sandbox_id: @sandbox_id, port: 3000)
-      daytona_preview_url = preview["url"]
-      daytona_preview_token = preview["token"]
-
-      # Deploy Cloudflare worker for auth
-      print "Setting up auth..."
-      @sandbox.deploy_session_worker(slug, access_token, daytona_preview_url, daytona_preview_token)
+      # Setup tunnel
+      print "Setting up tunnel..."
+      setup_cloudflared_tunnel
       puts " done"
 
       # Write Procfile
@@ -111,83 +107,93 @@ module Kml
       )
       puts " done"
 
-      # Install dependencies and setup
+      # Start PostgreSQL
+      print "Starting PostgreSQL..."
+      exec_sh("sudo service postgresql start")
+      exec_sh("sudo -u postgres createuser -s daytona 2>/dev/null || true")
+      exec_sh("createdb #{db_name} 2>/dev/null || true")
+      puts " done"
+
+      # Install dependencies
       puts "Running install..."
       config.install.each do |cmd|
         puts "  $ #{cmd}"
-        exec_sh("cd #{code_path} && #{mise_prefix} #{cmd}")
-      end
-
-      # Start tmux with overmind and claude
-      puts "Starting processes..."
-
-      # Create tmux session with app and claude windows
-      exec_sh(<<~SH)
-        tmux new-session -d -s kml -n app
-        tmux send-keys -t kml:app 'cd #{code_path} && #{mise_prefix} PORT=3000 overmind start' Enter
-        tmux new-window -t kml -n claude
-      SH
-
-      # Start Claude in the claude window
-      claude_command = build_claude_cmd(prompt, new_session: true, print_mode: print_mode || detached, json_mode: json_mode)
-      exec_sh("tmux send-keys -t kml:claude #{Shellwords.escape(claude_command)} Enter")
-
-      puts ""
-      puts "Session '#{slug}' started"
-      puts "URL: #{public_url_with_token}"
-
-      if detached
-        puts "Use 'kml session continue #{slug}' to attach."
-      else
-        attach!
-      end
-    end
-
-    def continue!(prompt: nil, detached: false, json_mode: false)
-      # Ensure sandbox is running
-      unless running?
-        print "Starting sandbox..."
-        @daytona.start_sandbox(sandbox_id)
-        @daytona.wait_for_sandbox(sandbox_id)
-        puts " ready"
-      end
-
-      if prompt
-        cmd = build_claude_cmd(prompt, print_mode: detached, json_mode: json_mode)
-        exec_sh("tmux send-keys -t kml:claude #{Shellwords.escape(cmd)} Enter")
-      end
-
-      attach! unless detached
-    end
-
-    def attach!
-      # Get SSH access info
-      ssh_info = @daytona.get_sandbox(sandbox_id)
-
-      # Use Daytona's SSH access
-      # For now, we'll use the toolbox to create an interactive session
-      puts "Attaching to session..."
-      puts "(Use Ctrl+B D to detach from tmux)"
-
-      # Execute tmux attach in the sandbox
-      # This requires an interactive PTY which the REST API doesn't support well
-      # So we'll use SSH if available, or provide instructions
-
-      ssh_url = ssh_info.dig("sshAccess", "sshUrl")
-      if ssh_url
-        # Parse ssh://user@host:port format
-        match = ssh_url.match(%r{ssh://([^@]+)@([^:]+):(\d+)})
-        if match
-          user, host, port = match.captures
-          Kernel.exec("ssh", "-t", "-p", port, "#{user}@#{host}", "tmux attach -t kml")
+        result = exec_sh("cd #{code_path} && POSTGRES_DB=#{db_name} #{mise_prefix} #{cmd}")
+        if result["exitCode"] != 0
+          puts "    ERROR (exit #{result['exitCode']}): #{result['result']}"
         end
       end
 
-      # Fallback: show instructions
+      # Start app
+      puts "Starting app..."
+      @daytona.create_session(sandbox_id: @sandbox_id, session_id: "app")
+      @daytona.session_execute(
+        sandbox_id: @sandbox_id,
+        session_id: "app",
+        command: "cd #{code_path} && #{mise_prefix} POSTGRES_DB=#{db_name} PORT=3000 overmind start"
+      )
+
+      # Start tunnel
+      puts "Starting tunnel..."
+      if config.tunnel_id
+        @daytona.create_session(sandbox_id: @sandbox_id, session_id: "tunnel")
+        @daytona.session_execute(
+          sandbox_id: @sandbox_id,
+          session_id: "tunnel",
+          command: "cloudflared tunnel --config /home/daytona/.cloudflared/config.yml --protocol http2 run"
+        )
+      end
+
       puts ""
-      puts "To attach manually, use the Daytona dashboard or CLI:"
-      puts "  daytona ssh #{sandbox_id}"
-      puts "  tmux attach -t kml"
+      puts "Session '#{slug}' ready"
+      puts "URL: #{public_url}"
+      puts ""
+      puts "Run: kml session prompt #{slug} \"your prompt\""
+    end
+
+    # Run Claude (new conversation or resume)
+    def run!(prompt:, resume_uuid: nil)
+      raise Error, "Prompt required" if prompt.nil? || prompt.empty?
+
+      unless running?
+        raise Error, "Sandbox not running. Run 'kml session new #{slug}' first."
+      end
+
+      uuid = resume_uuid || SecureRandom.uuid
+      session_flag = resume_uuid ? "--resume #{uuid}" : "--session-id #{uuid}"
+
+      # Track conversation
+      if resume_uuid
+        SessionStore.update_conversation(slug, uuid: uuid, prompt: prompt)
+      else
+        SessionStore.add_conversation(slug, uuid: uuid, prompt: prompt)
+      end
+
+      script = <<~SH
+        #!/bin/bash
+        export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
+        #{claude_env_export}
+        cd #{code_path}
+        claude #{session_flag} --dangerously-skip-permissions -p --verbose --output-format=stream-json #{Shellwords.escape(prompt)} 2>&1
+      SH
+
+      @daytona.upload_file(
+        sandbox_id: @sandbox_id,
+        path: "/tmp/run_claude.sh",
+        content: script
+      )
+
+      result = @daytona.execute_command(
+        sandbox_id: @sandbox_id,
+        command: "bash /tmp/run_claude.sh",
+        timeout: 600
+      )
+
+      puts result["result"]
+    end
+
+    def conversations
+      SessionStore.conversations(slug)
     end
 
     def stop!
@@ -204,63 +210,86 @@ module Kml
     def delete!
       stop!
 
-      # Delete sandbox
       if sandbox_id
         begin
           @daytona.delete_sandbox(sandbox_id)
-        rescue => e
-          # Ignore errors
+        rescue
         end
       end
 
-      # Delete worker and route
       @sandbox.delete_session_worker(slug)
-
-      # Remove from store
       SessionStore.delete(slug)
     end
 
     private
 
     def exec_sh(cmd)
-      # Use sh -c wrapper for shell operators
       @daytona.execute_command(
         sandbox_id: @sandbox_id,
-        command: "sh -c #{Shellwords.escape(cmd)}",
-        timeout: 300
+        command: "bash -c #{cmd.inspect}",
+        timeout: 600
       )
     end
 
+    def db_name
+      slug.gsub("-", "_") + "_dev"
+    end
+
     def mise_prefix
-      'export PATH="$HOME/.local/bin:$PATH" && eval "$(mise activate bash)" &&'
+      'export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH" &&'
     end
 
-    def claude_env
-      env = []
-      env << "ANTHROPIC_AUTH_TOKEN=#{config.send(:load_env_var, 'ANTHROPIC_AUTH_TOKEN')}" if config.send(:load_env_var, 'ANTHROPIC_AUTH_TOKEN')
-      env << "ANTHROPIC_BASE_URL=#{config.send(:load_env_var, 'ANTHROPIC_BASE_URL')}" if config.send(:load_env_var, 'ANTHROPIC_BASE_URL')
-      env.join(" ")
-    end
-
-    def build_claude_cmd(prompt, new_session: false, print_mode: false, json_mode: false)
-      session_flag = new_session ? "--session-id #{uuid}" : "--resume #{uuid}"
-      cmd = "#{mise_prefix} cd #{code_path} && #{claude_env} claude #{session_flag} --dangerously-skip-permissions"
-      if print_mode || json_mode || prompt
-        cmd += " -p"
-        cmd += " --verbose --output-format=stream-json" if json_mode
-        cmd += " #{Shellwords.escape(prompt)}" if prompt
-      end
-      cmd
+    def claude_env_export
+      lines = []
+      lines << "export ANTHROPIC_AUTH_TOKEN=#{config.send(:load_env_var, 'ANTHROPIC_AUTH_TOKEN')}" if config.send(:load_env_var, 'ANTHROPIC_AUTH_TOKEN')
+      lines << "export ANTHROPIC_BASE_URL=#{config.send(:load_env_var, 'ANTHROPIC_BASE_URL')}" if config.send(:load_env_var, 'ANTHROPIC_BASE_URL')
+      lines.join("\n")
     end
 
     def git_remote_url
-      `git remote get-url origin 2>/dev/null`.strip.presence
+      url = `git remote get-url origin 2>/dev/null`.strip
+      url.empty? ? nil : url
     end
 
-    def upload_local_code
-      # For now, skip - would need to implement file upload
-      # In practice, we'd use git clone from a remote
-      puts "Warning: Local code upload not yet implemented. Use GIT_REPO_URL."
+    def ssh_to_https(url)
+      if url =~ /^git@([^:]+):(.+)$/
+        "https://#{$1}/#{$2}"
+      else
+        url
+      end
+    end
+
+    def setup_cloudflared_tunnel
+      domain = config.send(:load_env_var, "CLOUDFLARE_DOMAIN")
+      tunnel_id = config.tunnel_id
+      credentials = config.tunnel_credentials
+
+      return unless domain && tunnel_id && credentials
+
+      hostname = "#{slug}.#{domain}"
+
+      @daytona.upload_file(
+        sandbox_id: @sandbox_id,
+        path: "/home/daytona/.cloudflared/credentials.json",
+        content: credentials
+      )
+
+      tunnel_config = <<~YAML
+        tunnel: #{tunnel_id}
+        credentials-file: /home/daytona/.cloudflared/credentials.json
+        ingress:
+          - hostname: #{hostname}
+            service: http://localhost:3000
+          - service: http_status:404
+      YAML
+
+      @daytona.upload_file(
+        sandbox_id: @sandbox_id,
+        path: "/home/daytona/.cloudflared/config.yml",
+        content: tunnel_config
+      )
+
+      @sandbox.ensure_tunnel_dns(slug)
     end
   end
 end

@@ -4,99 +4,96 @@ require "thor"
 
 module Kml
   class SessionCLI < Thor
-    desc "new SLUG [PROMPT]", "Create new session"
-    option :detached, aliases: "-d", type: :boolean, desc: "Run in background"
-    option :print, aliases: "-p", type: :boolean, desc: "Print mode: run prompt and exit"
-    option :json, aliases: "-j", type: :boolean, desc: "JSON output mode"
-    def new(slug, prompt = nil)
-      # Validate prompt requirement before creating session
-      if (options[:print] || options[:json] || options[:detached]) && prompt.nil?
-        raise Error, "Prompt required for -p/-j/-d modes"
+    desc "new SLUG", "Create new sandbox (no Claude yet)"
+    def new(slug)
+      SessionStore.create(slug)
+      session = build_session(slug)
+      session.start!
+    rescue Error => e
+      puts "Error: #{e.message}"
+      exit 1
+    end
+
+    desc "prompt SLUG PROMPT", "Run Claude in sandbox"
+    option :resume, aliases: "-r", type: :string, desc: "Resume conversation UUID"
+    def prompt(slug, prompt_text)
+      session = build_session(slug)
+      session.run!(prompt: prompt_text, resume_uuid: options[:resume])
+    rescue Error => e
+      puts "Error: #{e.message}"
+      exit 1
+    end
+
+    desc "list [SLUG]", "List sessions or conversations in a session"
+    def list(slug = nil)
+      if slug
+        # List conversations in this session
+        session_data = SessionStore.find(slug)
+        raise Error, "Session '#{slug}' not found" unless session_data
+
+        convs = session_data[:conversations] || []
+        if convs.empty?
+          puts "No conversations in '#{slug}'."
+          puts "Run: kml session prompt #{slug} \"your prompt\""
+          return
+        end
+
+        puts format("%-38s %-20s %s", "UUID", "CREATED", "LAST PROMPT")
+        puts "-" * 80
+        convs.each do |c|
+          puts format("%-38s %-20s %s", c[:uuid], c[:created_at][0..18], c[:last_prompt])
+        end
+      else
+        # List all sessions
+        sessions = SessionStore.all
+        if sessions.empty?
+          puts "No sessions."
+          return
+        end
+
+        daytona, _sandbox = build_daytona_and_sandbox
+
+        puts format("%-20s %-10s %-5s %s", "SLUG", "STATUS", "CONVS", "SANDBOX")
+        puts "-" * 80
+
+        sessions.each do |slug_sym, data|
+          status = "unknown"
+          sandbox_id = data[:sandbox_id] || "-"
+          convs = (data[:conversations] || []).size
+
+          if data[:sandbox_id]
+            begin
+              sb = daytona.get_sandbox(data[:sandbox_id])
+              status = sb["state"] || "unknown"
+            rescue
+              status = "deleted?"
+            end
+          else
+            status = "not started"
+          end
+
+          puts format("%-20s %-10s %-5d %s", slug_sym, status, convs, sandbox_id)
+        end
       end
-
-      session_data = SessionStore.find_or_create(slug)
-      session = build_session(session_data)
-
-      session.start!(
-        prompt: prompt,
-        detached: options[:detached],
-        print_mode: options[:print] || options[:detached],
-        json_mode: options[:json]
-      )
     rescue Error => e
       puts "Error: #{e.message}"
       exit 1
     end
 
-    desc "continue SLUG [PROMPT]", "Continue existing session"
-    option :detached, aliases: "-d", type: :boolean, desc: "Run in background"
-    option :json, aliases: "-j", type: :boolean, desc: "JSON output mode"
-    def continue(slug, prompt = nil)
-      session_data = SessionStore.find(slug)
-      raise Error, "Session '#{slug}' not found" unless session_data
-
-      session = build_session(session_data)
-      session.continue!(prompt: prompt, detached: options[:detached], json_mode: options[:json])
-    rescue Error => e
-      puts "Error: #{e.message}"
-      exit 1
-    end
-
-    desc "stop SLUG", "Stop session (keep sandbox)"
+    desc "stop SLUG", "Stop sandbox"
     def stop(slug)
-      session_data = SessionStore.find(slug)
-      raise Error, "Session '#{slug}' not found" unless session_data
-
-      session = build_session(session_data)
+      session = build_session(slug)
       session.stop!
     rescue Error => e
       puts "Error: #{e.message}"
       exit 1
     end
 
-    desc "delete SLUG", "Delete session and all resources"
+    desc "delete SLUG", "Delete session and sandbox"
     def delete(slug)
-      session_data = SessionStore.find(slug)
-      raise Error, "Session '#{slug}' not found" unless session_data
-
-      session = build_session(session_data)
+      session = build_session(slug)
       session.delete!
       puts "Session '#{slug}' deleted."
-    rescue Error => e
-      puts "Error: #{e.message}"
-      exit 1
-    end
-
-    desc "list", "List all sessions"
-    def list
-      sessions = SessionStore.all
-      if sessions.empty?
-        puts "No sessions."
-        return
-      end
-
-      daytona, sandbox = build_daytona_and_sandbox
-
-      puts format("%-20s %-10s %s", "SLUG", "STATUS", "SANDBOX")
-      puts "-" * 70
-
-      sessions.each do |slug, data|
-        status = "unknown"
-        sandbox_id = data[:sandbox_id] || "-"
-
-        if data[:sandbox_id]
-          begin
-            sb = daytona.get_sandbox(data[:sandbox_id])
-            status = sb["state"] || "unknown"
-          rescue
-            status = "deleted?"
-          end
-        else
-          status = "not started"
-        end
-
-        puts format("%-20s %-10s %s", slug, status, sandbox_id)
-      end
     rescue Error => e
       puts "Error: #{e.message}"
       exit 1
@@ -115,12 +112,14 @@ module Kml
       [daytona, sandbox]
     end
 
-    def build_session(data)
+    def build_session(slug)
+      data = SessionStore.find(slug)
+      raise Error, "Session '#{slug}' not found" unless data
+
       daytona, sandbox = build_daytona_and_sandbox
 
       Session.new(
         slug: data[:slug],
-        uuid: data[:uuid],
         sandbox_id: data[:sandbox_id],
         access_token: data[:access_token],
         created_at: data[:created_at],
