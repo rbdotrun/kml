@@ -1,8 +1,22 @@
+inherit_gem:
+  rubocop-rails-omakase: rubocop.yml
+
+plugins:
+  - rubocop-minitest
+
 AllCops:
-  TargetRubyVersion: 3.1
+  TargetRubyVersion: 3.4
+  NewCops: enable
 
-Style/StringLiterals:
-  EnforcedStyle: double_quotes
+Style/HashSyntax:
+  EnforcedStyle: ruby19_no_mixed_keys
+  EnforcedShorthandSyntax: always
 
-Style/StringLiteralsInInterpolation:
-  EnforcedStyle: double_quotes
+Layout/IndentationConsistency:
+  Enabled: true
+
+Layout/IndentationWidth:
+  Enabled: true
+
+Minitest/MultipleAssertions:
+  Enabled: true

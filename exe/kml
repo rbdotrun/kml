@@ -3,4 +3,4 @@
 
 require "kml"
 
-Kml::CLI.start(ARGV)
+Kml::Cli::Main.start(ARGV)

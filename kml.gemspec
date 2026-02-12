@@ -5,8 +5,8 @@ require_relative "lib/kml/version"
 Gem::Specification.new do |spec|
   spec.name = "kml"
   spec.version = Kml::VERSION
-  spec.authors = ["Ben"]
-  spec.email = ["ben@dee.mx"]
+  spec.authors = [ "Ben" ]
+  spec.email = [ "ben@dee.mx" ]
 
   spec.summary = "Kamal sandbox deployment tool"
   spec.description = "Deploy development sandboxes from existing Kamal production configs"
@@ -24,8 +24,8 @@ Gem::Specification.new do |spec|
     end
   end
   spec.bindir = "exe"
-  spec.executables = ["kml"]
-  spec.require_paths = ["lib"]
+  spec.executables = [ "kml" ]
+  spec.require_paths = [ "lib" ]
 
   spec.add_dependency "faraday", "~> 2.0"
   spec.add_dependency "faraday-multipart", "~> 1.0"
