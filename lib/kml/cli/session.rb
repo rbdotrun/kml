@@ -92,18 +92,16 @@ module Kml
           daytona = Config.build_daytona(config)
           cloudflare = Config.build_cloudflare(config)
           ai = Config.build_ai(config)
-          runtime = Config.build_runtime(config)
 
           Kml::Core::Session.new(
             slug:,
             ai:,
-            runtime:,
             daytona:,
             cloudflare:,
             git_repo: config[:git_repo],
             git_token: config[:git_token],
-            install: config[:install],
-            processes: config[:processes],
+            install: config[:install] || [],
+            processes: config[:processes] || {},
             service_name: config[:service_name],
             sandbox_id: data[:sandbox_id],
             access_token: data[:access_token],

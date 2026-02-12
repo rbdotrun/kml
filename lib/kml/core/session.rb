@@ -4,6 +4,8 @@ require "securerandom"
 
 module Kml
   module Core
+    class InstallError < StandardError; end
+
     class Session
       attr_reader :slug, :sandbox_id, :access_token, :created_at, :uuid, :tunnel_id, :tunnel_token
 
@@ -11,7 +13,6 @@ module Kml
       #
       # @param slug [String] Unique session identifier
       # @param ai [Kml::Ai::Base] AI backend instance
-      # @param runtime [Kml::Runtime::Base] Runtime instance
       # @param daytona [Kml::Infra::Daytona] Daytona API client
       # @param cloudflare [Kml::Infra::Cloudflare] Cloudflare API client
       # @param git_repo [String] Git repository URL
@@ -29,7 +30,6 @@ module Kml
       def initialize(
         slug:,
         ai:,
-        runtime:,
         daytona:,
         cloudflare:,
         git_repo:,
@@ -47,14 +47,13 @@ module Kml
       )
         @slug = slug
         @ai = ai
-        @runtime = runtime
         @daytona = daytona
         @cloudflare = cloudflare
         @git_repo = git_repo
         @git_branch = git_branch
         @git_token = git_token
-        @install = install.empty? ? runtime.default_install : install
-        @processes = processes.empty? ? runtime.default_processes : processes
+        @install = install
+        @processes = processes
         @env = env
         @service_name = service_name
         @sandbox_id = sandbox_id
@@ -86,7 +85,7 @@ module Kml
       end
 
       # Create sandbox and start the session
-      def start!
+      def start!(&block)
         sandbox_name = "kml-#{@service_name}-#{@slug}"
 
         # Delete existing sandbox if any
@@ -96,8 +95,8 @@ module Kml
           begin
             @daytona.delete_sandbox(existing["id"])
             sleep 2
-          rescue StandardError
-            # Ignore errors
+          rescue StandardError => e
+            puts " warning: #{e.message}"
           end
           puts " done"
         end
@@ -112,7 +111,7 @@ module Kml
         )
 
         @sandbox_id = sandbox_result["id"]
-        yield(:sandbox_created, @sandbox_id) if block_given?
+        block&.call(:sandbox_created, @sandbox_id)
 
         print "Waiting for sandbox..."
         @daytona.wait_for_sandbox(@sandbox_id)
@@ -122,7 +121,7 @@ module Kml
         setup_tunnel
         write_procfile
         start_postgres
-        run_install_commands
+        run_install_commands(&block)
         start_app
         start_tunnel
         deploy_worker
@@ -138,8 +137,9 @@ module Kml
       #
       # @param prompt [String] The prompt to send
       # @param resume [Boolean] Whether to resume the previous conversation
+      # @param session_id [String, nil] Session ID for conversation continuity
       # @yield [String] Yields each line of JSON output
-      def run!(prompt:, resume: false, &block)
+      def run!(prompt:, resume: false, session_id: nil, &block)
         raise Kml::Error, "Prompt required" if prompt.nil? || prompt.empty?
 
         unless running?
@@ -149,7 +149,7 @@ module Kml
         executor = method(:exec_pty)
         @ai.run(
           prompt:,
-          session_id: @uuid,
+          session_id: session_id || @uuid,
           resume:,
           cwd: code_path,
           executor:
@@ -175,10 +175,13 @@ module Kml
         stop!
 
         if @sandbox_id
+          # Wait for sandbox to finish stopping before deleting
+          wait_for_sandbox_stopped
+
           begin
             @daytona.delete_sandbox(@sandbox_id)
-          rescue StandardError
-            # Ignore errors
+          rescue StandardError => e
+            puts "Warning: failed to delete sandbox: #{e.message}"
           end
         end
 
@@ -205,6 +208,25 @@ module Kml
       end
 
       private
+
+        def wait_for_sandbox_stopped(timeout: 30)
+          return unless @sandbox_id
+
+          print "Waiting for sandbox to stop..."
+          start = Time.now
+          loop do
+            sandbox = @daytona.get_sandbox(@sandbox_id)
+            state = sandbox["state"]
+            break if %w[stopped error].include?(state)
+            break if Time.now - start > timeout
+
+            print "."
+            sleep 1
+          end
+          puts " done"
+        rescue StandardError
+          puts " skipped"
+        end
 
         def snapshot_name
           "kml-#{@service_name}"
@@ -293,13 +315,26 @@ module Kml
           puts " done"
         end
 
-        def run_install_commands
+        def run_install_commands(&block)
           puts "Running install..."
-          @install.each do |cmd|
+          @install.each do |item|
+            # Support both formats: string or {name:, command:}
+            if item.is_a?(Hash)
+              name = item["name"] || item[:name]
+              cmd = item["command"] || item[:command]
+            else
+              name = nil
+              cmd = item
+            end
+
             puts "  $ #{cmd}"
-            result = exec_sh("cd #{code_path} && POSTGRES_DB=#{db_name} #{mise_prefix} #{cmd}")
-            if result["exitCode"] != 0
-              puts "    ERROR (exit #{result['exitCode']}): #{result['result']}"
+            block&.call(:install_start, { name: name, command: cmd })
+            result = exec_sh("cd #{code_path} && #{mise_prefix} POSTGRES_DB=#{db_name} #{cmd}")
+            exit_code = result["exitCode"]
+            output = result["result"]
+            block&.call(:install_complete, { name: name, command: cmd, exit_code: exit_code, output: output })
+            if exit_code != 0
+              raise InstallError, "Install command failed: #{cmd}\nExit code: #{exit_code}\nOutput: #{output}"
             end
           end
         end

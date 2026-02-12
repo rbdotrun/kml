@@ -205,8 +205,8 @@ module Kml
 
         response = conn.get("snapshots", { limit: 1 })
         response.status == 200
-      rescue
-        false
+      rescue Faraday::Error, StandardError
+        false # Validation failed - connection error or invalid credentials
       end
 
       def validate_anthropic(key, base_url)
@@ -232,8 +232,8 @@ module Kml
         end
 
         response.status == 200
-      rescue
-        false
+      rescue Faraday::Error, StandardError
+        false # Validation failed - connection error or invalid credentials
       end
 
       def validate_github(token)
@@ -246,8 +246,8 @@ module Kml
 
         response = conn.get("user")
         response.status == 200
-      rescue
-        false
+      rescue Faraday::Error, StandardError
+        false # Validation failed - connection error or invalid credentials
       end
 
       def validate_cloudflare(token, account_id)
@@ -260,8 +260,8 @@ module Kml
 
         response = conn.get("accounts/#{account_id}")
         response.status == 200
-      rescue
-        false
+      rescue Faraday::Error, StandardError
+        false # Validation failed - connection error or invalid credentials
       end
 
       def write_env_file(credentials)

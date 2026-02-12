@@ -71,8 +71,8 @@ module Kml
             if data[:sandbox_id]
               begin
                 @daytona.delete_sandbox(data[:sandbox_id])
-              rescue StandardError
-                # Ignore errors
+              rescue StandardError => e
+                puts " warning: #{e.message}"
               end
             end
 

@@ -22,58 +22,10 @@ module Kml
       # 3. Subsequent requests use cookie for auth
       # 4. After auth, Worker passes through to tunnel origin (cloudflared -> localhost:3000)
       # 5. WebSocket upgrades work naturally since we just pass through the request
-      WORKER_SCRIPT = <<~JS
-        function parseCookies(cookieHeader) {
-          const cookies = {};
-          if (!cookieHeader) return cookies;
-          cookieHeader.split(";").forEach((cookie) => {
-            const [name, ...rest] = cookie.trim().split("=");
-            if (name) cookies[name] = rest.join("=");
-          });
-          return cookies;
-        }
-
-        export default {
-          async fetch(request, env) {
-            const url = new URL(request.url);
-            const path = url.pathname;
-
-            // Assets don't need auth - pass through to tunnel origin
-            if (path.startsWith("/assets/") || path.startsWith("/icon")) {
-              return fetch(request);
-            }
-
-            const cookies = parseCookies(request.headers.get("Cookie") || "");
-            const tokenParam = url.searchParams.get("token");
-            const cookieToken = cookies["kml_token"];
-
-            const token = tokenParam || cookieToken;
-            if (!token || token !== env.ACCESS_TOKEN) {
-              return new Response("Not Found", { status: 404 });
-            }
-
-            // First visit with token - set cookie and redirect to clean URL
-            // Skip redirect for WebSocket upgrades (ActionCable) - they need to pass through
-            const isWebSocket = request.headers.get("Upgrade") === "websocket";
-            if (tokenParam && !isWebSocket) {
-              url.searchParams.delete("token");
-              return new Response(null, {
-                status: 302,
-                headers: {
-                  Location: url.toString(),
-                  "Set-Cookie": `kml_token=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400`,
-                  "Cache-Control": "no-store",
-                },
-              });
-            }
-
-            // Pass through to tunnel origin
-            // cloudflared runs inside the sandbox and connects to localhost:3000
-            // No proxying needed - Cloudflare handles the tunnel connection
-            return fetch(request);
-          },
-        };
-      JS
+      #
+      # Merge Architecture:
+      # Apps can provide additional files, bindings, and HTML injection.
+      # KML provides base auth logic, app provides additions, KML merges them.
 
       def initialize(api_token:, account_id:, zone_id:, domain:)
         @api_token = api_token
@@ -82,7 +34,7 @@ module Kml
         @domain = domain
       end
 
-      attr_reader :domain
+      attr_reader :domain, :account_id, :zone_id, :api_token
 
       # Ensure DNS CNAME record exists for tunnel
       #
@@ -136,16 +88,32 @@ module Kml
         end
       end
 
-      # Deploy a Cloudflare Worker for session authentication
+      # Deploy a Cloudflare Worker with optional app-provided additions
       #
       # The Worker validates access tokens and sets HttpOnly cookies for auth.
       # After auth, requests pass through to the tunnel origin (cloudflared in sandbox).
       #
+      # Apps can provide:
+      # - files: Hash of { "filename.js" => "content" } to bundle into worker
+      # - bindings: Hash of { "VAR_NAME" => "value" } for env bindings
+      # - injection: HTML string to inject into response body
+      #
       # @param worker_name [String] Name of the worker
-      # @param access_token [String] Session access token
+      # @param access_token [String] Session access token (required for auth)
       # @param hostname [String] Hostname for the worker route
-      def deploy_worker(worker_name:, access_token:, hostname:)
-        upload_worker_script(worker_name:, access_token:)
+      # @param files [Hash] Optional files to bundle { "name.js" => "content" }
+      # @param bindings [Hash] Optional env bindings { "VAR" => "value" }
+      # @param injection [String, nil] Optional HTML to inject into <body>
+      def deploy_worker(worker_name:, access_token:, hostname:, files: {}, bindings: {}, injection: nil)
+        script = build_worker_script(files:, injection:)
+        all_bindings = build_bindings(access_token:, extra: bindings)
+
+        upload_worker(
+          worker_name:,
+          script:,
+          bindings: all_bindings,
+          files:
+        )
 
         create_or_update_worker_route(
           worker_name:,
@@ -171,8 +139,8 @@ module Kml
 
         # Delete worker
         delete_worker_script(worker_name)
-      rescue StandardError
-        # Ignore errors during cleanup
+      rescue StandardError => e
+        puts "Warning: cleanup failed: #{e.message}"
       end
 
       # Create or reuse a Cloudflare Tunnel for a session
@@ -237,9 +205,104 @@ module Kml
       #
       # @param tunnel_id [String] The tunnel ID to delete
       def delete_tunnel(tunnel_id:)
-        connection.delete("accounts/#{@account_id}/cfd_tunnel/#{tunnel_id}")
-      rescue StandardError
-        # Ignore errors during cleanup
+        return unless tunnel_id
+
+        # Clean up stale connections first (required before deletion)
+        connection.delete("accounts/#{@account_id}/cfd_tunnel/#{tunnel_id}/connections")
+
+        # Now delete the tunnel
+        response = connection.delete("accounts/#{@account_id}/cfd_tunnel/#{tunnel_id}")
+        unless response.success?
+          puts "Warning: failed to delete tunnel #{tunnel_id}: #{response.body}"
+        end
+      rescue StandardError => e
+        puts "Warning: failed to delete tunnel #{tunnel_id}: #{e.message}"
+      end
+
+      # Build worker script with optional file imports and injection
+      #
+      # @param files [Hash] Files to import { "name.js" => "content" }
+      # @param injection [String, nil] HTML to inject into body
+      # @return [String] Worker script
+      def build_worker_script(files: {}, injection: nil)
+        # Generate imports for each file
+        imports = files.keys.map do |filename|
+          var_name = filename.sub(/\.js$/, "").gsub(/[^a-zA-Z0-9]/, "_")
+          "import #{var_name} from './#{filename}';"
+        end.join("\n")
+
+        imports_block = imports.empty? ? "" : "#{imports}\n\n"
+        response_block = injection ? injection_block(injection) : "return response;"
+
+        <<~JS
+          #{imports_block}function parseCookies(cookieHeader) {
+            const cookies = {};
+            if (!cookieHeader) return cookies;
+            cookieHeader.split(";").forEach((cookie) => {
+              const [name, ...rest] = cookie.trim().split("=");
+              if (name) cookies[name] = rest.join("=");
+            });
+            return cookies;
+          }
+
+          export default {
+            async fetch(request, env) {
+              const url = new URL(request.url);
+              const path = url.pathname;
+
+              // Assets don't need auth - pass through to tunnel origin
+              if (path.startsWith("/assets/") || path.startsWith("/icon")) {
+                return fetch(request);
+              }
+
+              const cookies = parseCookies(request.headers.get("Cookie") || "");
+              const tokenParam = url.searchParams.get("token");
+              const cookieToken = cookies["kml_token"];
+
+              const token = tokenParam || cookieToken;
+              if (!token || token !== env.ACCESS_TOKEN) {
+                return new Response("Not Found", { status: 404 });
+              }
+
+              // First visit with token - set cookie and redirect to clean URL
+              // Skip redirect for WebSocket upgrades (ActionCable) - they need to pass through
+              const isWebSocket = request.headers.get("Upgrade") === "websocket";
+              if (tokenParam && !isWebSocket) {
+                url.searchParams.delete("token");
+                return new Response(null, {
+                  status: 302,
+                  headers: {
+                    Location: url.toString(),
+                    "Set-Cookie": `kml_token=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400`,
+                    "Cache-Control": "no-store",
+                  },
+                });
+              }
+
+              // Pass through to tunnel origin and optionally transform response
+              const response = await fetch(request);
+
+              #{response_block}
+            },
+          };
+        JS
+      end
+
+      # Build bindings array with ACCESS_TOKEN and optional extras
+      #
+      # @param access_token [String] Required auth token
+      # @param extra [Hash] Additional bindings { "VAR" => "value" }
+      # @return [Array] Bindings array for worker metadata
+      def build_bindings(access_token:, extra: {})
+        bindings = [
+          { type: "secret_text", name: "ACCESS_TOKEN", text: access_token }
+        ]
+
+        extra.each do |name, value|
+          bindings << { type: "plain_text", name: name.to_s, text: value.to_s }
+        end
+
+        bindings
       end
 
       private
@@ -291,26 +354,68 @@ module Kml
 
         # Workers
 
-        def upload_worker_script(worker_name:, access_token:)
+        # Generate injection block for HTMLRewriter
+        #
+        # @param injection [String] HTML to inject
+        # @return [String] JavaScript code
+        def injection_block(injection)
+          <<~JS.strip
+            const ct = response.headers.get("content-type") || "";
+            if (!ct.includes("text/html")) return response;
+
+            return new HTMLRewriter()
+              .on("body", {
+                element(el) {
+                  el.append(#{injection.to_json}, { html: true });
+                }
+              })
+              .transform(response);
+          JS
+        end
+
+        # Upload worker with merged files
+        #
+        # @param worker_name [String] Worker name
+        # @param script [String] Main worker script
+        # @param bindings [Array] Worker bindings
+        # @param files [Hash] Additional files to bundle
+        def upload_worker(worker_name:, script:, bindings:, files: {})
           metadata = {
             main_module: "worker.js",
-            bindings: [
-              { type: "secret_text", name: "ACCESS_TOKEN", text: access_token }
-            ]
+            bindings:
           }
+
+          parts = {
+            "worker.js" => multipart_file(script, "worker.js"),
+            "metadata" => multipart_json(metadata)
+          }
+
+          # Add each app-provided file as a module that exports content as default
+          files.each do |filename, content|
+            # Export content as default string (for injection/use in worker)
+            module_content = "export default #{content.to_json};"
+            parts[filename] = multipart_file(module_content, filename)
+          end
 
           multipart_connection.put(
             "accounts/#{@account_id}/workers/scripts/#{worker_name}",
-            "worker.js" => Faraday::Multipart::FilePart.new(
-              StringIO.new(WORKER_SCRIPT),
-              "application/javascript+module",
-              "worker.js"
-            ),
-            "metadata" => Faraday::Multipart::FilePart.new(
-              StringIO.new(JSON.generate(metadata)),
-              "application/json",
-              "metadata.json"
-            )
+            parts
+          )
+        end
+
+        def multipart_file(content, filename)
+          Faraday::Multipart::FilePart.new(
+            StringIO.new(content),
+            "application/javascript+module",
+            filename
+          )
+        end
+
+        def multipart_json(data)
+          Faraday::Multipart::FilePart.new(
+            StringIO.new(JSON.generate(data)),
+            "application/json",
+            "metadata.json"
           )
         end
 

@@ -5,7 +5,6 @@ require "test_helper"
 class Kml::Core::SessionTest < Minitest::Test
   def setup
     @ai = TestStub.new
-    @runtime = Kml::Runtime::Rails.new
     @daytona = TestStub.new(
       get_sandbox: { "state" => "started" }
     )
@@ -18,7 +17,6 @@ class Kml::Core::SessionTest < Minitest::Test
     defaults = {
       slug: "test-session",
       ai: @ai,
-      runtime: @runtime,
       daytona: @daytona,
       cloudflare: @cloudflare,
       git_repo: "https://github.com/user/repo.git",
@@ -147,5 +145,10 @@ class Kml::Core::SessionTest < Minitest::Test
     session = build_session
 
     assert_nil session.tunnel_token
+  end
+
+  def test_install_error_class_exists
+    assert_kind_of Class, Kml::Core::InstallError
+    assert Kml::Core::InstallError < StandardError
   end
 end

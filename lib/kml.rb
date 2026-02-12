@@ -18,6 +18,7 @@ require_relative "kml/runtime/rails"
 require_relative "kml/core/store"
 require_relative "kml/core/sandbox"
 require_relative "kml/core/session"
+require_relative "kml/core/resources"
 
 # CLI
 require_relative "kml/setup"

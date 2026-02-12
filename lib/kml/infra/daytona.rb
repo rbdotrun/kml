@@ -38,8 +38,7 @@ module Kml
 
       def find_snapshot_by_name(name)
         result = get("snapshots", { name: })
-        items = result["items"] || result
-        items = [ items ] if items.is_a?(Hash)
+        items = result.is_a?(Array) ? result : (result["items"] || [result])
         items&.find { |s| s["name"] == name }
       end
 
@@ -288,7 +287,7 @@ module Kml
           sleep 0.05
         end
 
-        ws.close rescue nil
+        ws.close rescue nil # Safe to ignore - connection may already be closed
       end
 
       # ============================================================
