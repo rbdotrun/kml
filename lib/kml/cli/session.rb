@@ -83,6 +83,44 @@ module Kml
         exit 1
       end
 
+      desc "ps SLUG", "Show process statuses"
+      def ps(slug)
+        config = Config.from_files
+        session = build_session_from_store(slug, config)
+        statuses = session.process_statuses
+
+        if statuses.empty?
+          puts "No processes running."
+          return
+        end
+
+        puts format("%-20s %s", "PROCESS", "STATUS")
+        puts "-" * 40
+        statuses.each do |p|
+          puts format("%-20s %s", p[:name], p[:status])
+        end
+      rescue Kml::Error => e
+        puts "Error: #{e.message}"
+        exit 1
+      end
+
+      desc "restart SLUG PROCESS", "Restart a process"
+      def restart(slug, process_name)
+        config = Config.from_files
+        session = build_session_from_store(slug, config)
+
+        print "Restarting #{process_name}..."
+        if session.restart_process(process_name)
+          puts " done"
+        else
+          puts " failed"
+          exit 1
+        end
+      rescue Kml::Error => e
+        puts "Error: #{e.message}"
+        exit 1
+      end
+
       private
 
         def build_session_from_config(slug, config)
