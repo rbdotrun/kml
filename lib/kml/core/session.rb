@@ -180,11 +180,11 @@ module Kml
 
         clone_repo
         setup_tunnel
+        write_tunnel_token
         write_procfile
         start_postgres
         run_install_commands(&block)
         start_app
-        start_tunnel
         deploy_worker
 
         puts ""
@@ -359,11 +359,17 @@ module Kml
 
         def write_procfile
           print "Configuring processes..."
-          procfile_content = @processes.map { |name, cmd| "#{name}: #{cmd}" }.join("\n")
+          lines = @processes.map { |name, cmd| "#{name}: #{cmd}" }
+
+          # Add tunnel as a system process if configured
+          if @tunnel_token
+            lines << "tunnel: cloudflared tunnel run --protocol http2 --token-file /tmp/tunnel-token"
+          end
+
           @daytona.upload_file(
             sandbox_id: @sandbox_id,
             path: "#{code_path}/Procfile",
-            content: procfile_content
+            content: lines.join("\n")
           )
           puts " done"
         end
@@ -410,24 +416,16 @@ module Kml
           )
         end
 
-        def start_tunnel
+        def write_tunnel_token
           return unless @tunnel_token
 
-          puts "Starting tunnel..."
-
-          # Write token to file (avoid shell escaping issues)
+          print "Writing tunnel token..."
           @daytona.upload_file(
             sandbox_id: @sandbox_id,
             path: "/tmp/tunnel-token",
             content: @tunnel_token
           )
-
-          @daytona.create_session(sandbox_id: @sandbox_id, session_id: "tunnel")
-          @daytona.session_execute(
-            sandbox_id: @sandbox_id,
-            session_id: "tunnel",
-            command: "cloudflared tunnel run --protocol http2 --token-file /tmp/tunnel-token"
-          )
+          puts " done"
         end
 
         # Deploy Cloudflare Worker for auth in front of tunnel
