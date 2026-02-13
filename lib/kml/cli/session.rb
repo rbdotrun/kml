@@ -121,6 +121,25 @@ module Kml
         exit 1
       end
 
+      desc "logs SLUG PROCESS", "Stream process logs"
+      option :follow, aliases: "-f", type: :boolean, default: false, desc: "Follow log output"
+      option :lines, aliases: "-n", type: :numeric, default: 100, desc: "Number of lines to show"
+      def logs(slug, process_name)
+        config = Config.from_files
+        session = build_session_from_store(slug, config)
+
+        session.process_logs(process_name, lines: options[:lines], follow: options[:follow]) do |line|
+          puts line
+          $stdout.flush
+        end
+      rescue Kml::Error => e
+        puts "Error: #{e.message}"
+        exit 1
+      rescue Interrupt
+        # Ctrl+C exits cleanly
+        puts "\nStopped."
+      end
+
       private
 
         def build_session_from_config(slug, config)

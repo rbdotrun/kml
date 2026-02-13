@@ -125,6 +125,39 @@ module Kml
         false
       end
 
+      # Stream logs from a specific process via overmind
+      # @param process_name [String] Name of the process
+      # @param lines [Integer] Number of recent lines to fetch (0 = all)
+      # @param follow [Boolean] Whether to follow/tail the logs
+      # @yield [String] Yields each line of log output
+      def process_logs(process_name, lines: 100, follow: false, &block)
+        return unless @sandbox_id
+
+        if follow
+          # Use PTY to stream logs in real-time
+          # overmind echo follows by default, we use timeout to control duration
+          @daytona.run_pty_command(
+            sandbox_id: @sandbox_id,
+            command: "cd #{code_path} && overmind echo #{process_name}",
+            timeout: 3600,
+            &block
+          )
+        else
+          # Fetch recent logs (overmind echo with timeout)
+          # Use script to capture output since overmind echo doesn't have a non-follow mode
+          result = @daytona.execute_command(
+            sandbox_id: @sandbox_id,
+            command: "cd #{code_path} && timeout 2 overmind echo #{process_name} 2>/dev/null || true",
+            timeout: 10
+          )
+          output = result["result"].to_s
+          log_lines = output.split("\n")
+          log_lines = log_lines.last(lines) if lines.positive?
+          log_lines.each { |line| block.call(line) } if block
+          log_lines
+        end
+      end
+
       # Create sandbox and start the session
       def start!(&block)
         sandbox_name = "kml-#{@service_name}-#{@slug}"
