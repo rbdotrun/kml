@@ -100,7 +100,7 @@ module Kml
 
         result = @daytona.execute_command(
           sandbox_id: @sandbox_id,
-          command: "cd #{code_path} && overmind status 2>/dev/null || echo ''",
+          command: "bash -c 'cd #{code_path} && overmind status 2>/dev/null || true'",
           timeout: 10
         )
 
@@ -117,7 +117,7 @@ module Kml
 
         @daytona.execute_command(
           sandbox_id: @sandbox_id,
-          command: "cd #{code_path} && overmind restart #{process_name}",
+          command: "bash -c 'cd #{code_path} && overmind restart #{process_name}'",
           timeout: 30
         )
         true
@@ -125,37 +125,24 @@ module Kml
         false
       end
 
-      # Stream logs from a specific process via overmind
-      # @param process_name [String] Name of the process
-      # @param lines [Integer] Number of recent lines to fetch (0 = all)
-      # @param follow [Boolean] Whether to follow/tail the logs
-      # @yield [String] Yields each line of log output
-      def process_logs(process_name, lines: 100, follow: false, &block)
-        return unless @sandbox_id
+      # Get logs from the app session
+      # @param session_id [String] Session ID (default: "app")
+      # @return [String] Raw log output
+      def session_logs(session_id = "app")
+        return "" unless @sandbox_id
 
-        if follow
-          # Use PTY to stream logs in real-time
-          # overmind echo follows by default, we use timeout to control duration
-          @daytona.run_pty_command(
-            sandbox_id: @sandbox_id,
-            command: "cd #{code_path} && overmind echo #{process_name}",
-            timeout: 3600,
-            &block
-          )
-        else
-          # Fetch recent logs (overmind echo with timeout)
-          # Use script to capture output since overmind echo doesn't have a non-follow mode
-          result = @daytona.execute_command(
-            sandbox_id: @sandbox_id,
-            command: "cd #{code_path} && timeout 2 overmind echo #{process_name} 2>/dev/null || true",
-            timeout: 10
-          )
-          output = result["result"].to_s
-          log_lines = output.split("\n")
-          log_lines = log_lines.last(lines) if lines.positive?
-          log_lines.each { |line| block.call(line) } if block
-          log_lines
-        end
+        sessions = @daytona.list_sessions(sandbox_id: @sandbox_id)
+        session = sessions&.find { |s| s["sessionId"] == session_id }
+        return "" unless session
+
+        command = session["commands"]&.first
+        return "" unless command
+
+        @daytona.get_command_logs(
+          sandbox_id: @sandbox_id,
+          session_id: session_id,
+          command_id: command["id"]
+        ).to_s
       end
 
       # Create sandbox and start the session
@@ -474,16 +461,21 @@ module Kml
         end
 
         # Parse overmind status output
-        # Input: "web   | running\ncss   | running\n"
+        # Format: "PROCESS   PID       STATUS\nweb       1234      running\n"
         # Output: [{ name: "web", status: "running" }, { name: "css", status: "running" }]
         def parse_overmind_status(output)
-          output.split("\n").filter_map do |line|
+          lines = output.split("\n")
+          # Skip header line
+          lines.shift if lines.first&.match?(/^PROCESS\s+PID\s+STATUS/i)
+
+          lines.filter_map do |line|
             next if line.strip.empty?
 
-            parts = line.split("|").map(&:strip)
-            next unless parts.length == 2
+            # Format: "web       1234      running" (whitespace separated)
+            parts = line.strip.split(/\s+/)
+            next unless parts.length >= 3
 
-            { name: parts[0], status: parts[1] }
+            { name: parts[0], status: parts[2] }
           end
         end
     end

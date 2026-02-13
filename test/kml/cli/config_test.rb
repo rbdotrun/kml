@@ -29,8 +29,9 @@ class Kml::Cli::ConfigTest < Minitest::Test
   def test_from_files_reads_kml_yml
     config = Kml::Cli::Config.from_files(root: @tmpdir)
 
-    assert_includes config[:install], "bundle install"
-    assert_includes config[:install], "bin/rails db:prepare"
+    commands = config[:install].map { |i| i["command"] }
+    assert_includes commands, "bundle install"
+    assert_includes commands, "bin/rails db:prepare"
   end
 
   def test_from_files_returns_install_array

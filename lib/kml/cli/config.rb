@@ -21,7 +21,7 @@ module Kml
       def initialize(root: Dir.pwd)
         @root = root
         config = load_yaml(File.join(root, KML_CONFIG))
-        @install = config["install"] || []
+        @install = normalize_install(config["install"] || [])
         @processes = config["processes"] || {}
         @ai_config = config["ai"] || {}
         @runtime_name = config["runtime"] || "rails"
@@ -206,6 +206,31 @@ module Kml
           return nil unless File.exist?(path)
 
           File.read(path)[/^#{name}=(.+)$/, 1]&.strip
+        end
+
+        # Normalize install commands to array of hashes
+        # Supports:
+        #   - Array of strings: ["cmd1", "cmd2"]
+        #   - Array of hashes: [{name: "x", command: "cmd"}]
+        #   - Hash: {name: command} -> [{name: "name", command: "command"}]
+        def normalize_install(install)
+          case install
+          when Array
+            install.map do |item|
+              case item
+              when String
+                { "command" => item }
+              when Hash
+                item
+              else
+                { "command" => item.to_s }
+              end
+            end
+          when Hash
+            install.map { |name, cmd| { "name" => name, "command" => cmd } }
+          else
+            []
+          end
         end
     end
   end

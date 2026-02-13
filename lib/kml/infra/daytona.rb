@@ -288,6 +288,9 @@ module Kml
         end
 
         ws.close rescue nil # Safe to ignore - connection may already be closed
+
+        # Clean up PTY session
+        delete_session(sandbox_id:, session_id: pty_id) rescue nil
       end
 
       # ============================================================
