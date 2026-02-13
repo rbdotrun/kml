@@ -64,6 +64,7 @@ class Kml::Infra::CloudflareTest < Minitest::Test
 
   def test_build_worker_script_generates_valid_script
     script = @cloudflare.build_worker_script
+
     assert_operator script.length, :>, 100
     assert_includes script, "export default"
   end
@@ -84,13 +85,15 @@ class Kml::Infra::CloudflareTest < Minitest::Test
 
   def test_build_worker_script_with_no_injection_returns_response
     script = @cloudflare.build_worker_script
+
     assert_includes script, "return response;"
     refute_includes script, "HTMLRewriter"
   end
 
   def test_build_worker_script_with_injection_uses_html_rewriter
     injection = "<script>console.log('hello')</script>"
-    script = @cloudflare.build_worker_script(injection: injection)
+    script = @cloudflare.build_worker_script(injection:)
+
     assert_includes script, "HTMLRewriter"
     assert_includes script, "text/html"
     assert_includes script, "el.append"
@@ -98,6 +101,7 @@ class Kml::Infra::CloudflareTest < Minitest::Test
 
   def test_build_worker_script_with_files_generates_imports
     script = @cloudflare.build_worker_script(files: { "console.js" => "content" })
+
     assert_includes script, "import console from './console.js';"
   end
 
@@ -106,6 +110,7 @@ class Kml::Infra::CloudflareTest < Minitest::Test
       "console.js" => "content1",
       "other.js" => "content2"
     })
+
     assert_includes script, "import console from './console.js';"
     assert_includes script, "import other from './other.js';"
   end
@@ -115,6 +120,7 @@ class Kml::Infra::CloudflareTest < Minitest::Test
   def test_build_bindings_always_includes_access_token
     bindings = @cloudflare.build_bindings(access_token: "secret123")
     access_token_binding = bindings.find { |b| b[:name] == "ACCESS_TOKEN" }
+
     assert_equal "secret123", access_token_binding[:text]
     assert_equal "secret_text", access_token_binding[:type]
   end
@@ -122,6 +128,7 @@ class Kml::Infra::CloudflareTest < Minitest::Test
   def test_build_bindings_merges_extra_bindings
     bindings = @cloudflare.build_bindings(access_token: "secret", extra: { "WS_URL" => "wss://example.com" })
     ws_url_binding = bindings.find { |b| b[:name] == "WS_URL" }
+
     assert_equal "wss://example.com", ws_url_binding[:text]
     assert_equal "plain_text", ws_url_binding[:type]
   end
@@ -129,6 +136,7 @@ class Kml::Infra::CloudflareTest < Minitest::Test
   def test_build_bindings_converts_keys_to_strings
     bindings = @cloudflare.build_bindings(access_token: "secret", extra: { api_url: "https://api.example.com" })
     api_binding = bindings.find { |b| b[:name] == "api_url" }
+
     assert_equal "https://api.example.com", api_binding[:text]
   end
 end

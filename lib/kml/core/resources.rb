@@ -29,7 +29,7 @@ module Kml
           }
         end
       rescue StandardError => e
-        [{ error: e.message }]
+        [ { error: e.message } ]
       end
 
       # List Cloudflare tunnels (kml-* only)
@@ -50,7 +50,7 @@ module Kml
             }
           end
       rescue StandardError => e
-        [{ error: e.message }]
+        [ { error: e.message } ]
       end
 
       # List Cloudflare workers (kml-* only)
@@ -70,7 +70,7 @@ module Kml
             }
           end
       rescue StandardError => e
-        [{ error: e.message }]
+        [ { error: e.message } ]
       end
 
       # List Cloudflare DNS records (tunnel CNAMEs only)
@@ -90,7 +90,7 @@ module Kml
             }
           end
       rescue StandardError => e
-        [{ error: e.message }]
+        [ { error: e.message } ]
       end
 
       # Pretty print all resources
@@ -154,13 +154,13 @@ module Kml
 
       private
 
-      def cloudflare_conn
-        @cloudflare_conn ||= Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
-          f.request :json
-          f.response :json
-          f.headers["Authorization"] = "Bearer #{@cloudflare.api_token}"
+        def cloudflare_conn
+          @cloudflare_conn ||= Faraday.new(url: "https://api.cloudflare.com/client/v4") do |f|
+            f.request :json
+            f.response :json
+            f.headers["Authorization"] = "Bearer #{@cloudflare.api_token}"
+          end
         end
-      end
     end
   end
 end

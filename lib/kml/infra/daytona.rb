@@ -38,7 +38,7 @@ module Kml
 
       def find_snapshot_by_name(name)
         result = get("snapshots", { name: })
-        items = result.is_a?(Array) ? result : (result["items"] || [result])
+        items = result.is_a?(Array) ? result : (result["items"] || [ result ])
         items&.find { |s| s["name"] == name }
       end
 

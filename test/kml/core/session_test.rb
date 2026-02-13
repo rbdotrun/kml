@@ -149,6 +149,6 @@ class Kml::Core::SessionTest < Minitest::Test
 
   def test_install_error_class_exists
     assert_kind_of Class, Kml::Core::InstallError
-    assert Kml::Core::InstallError < StandardError
+    assert_operator Kml::Core::InstallError, :<, StandardError
   end
 end

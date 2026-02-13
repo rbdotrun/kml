@@ -356,17 +356,21 @@ module Kml
 
         # Generate injection block for HTMLRewriter
         #
-        # @param injection [String] HTML to inject
+        # @param injection [String] HTML to inject (can contain ${var} template literals)
         # @return [String] JavaScript code
         def injection_block(injection)
+          # Escape backticks and backslashes for template literal
+          escaped = injection.gsub("\\", "\\\\\\\\").gsub("`", '\\`')
+
           <<~JS.strip
             const ct = response.headers.get("content-type") || "";
             if (!ct.includes("text/html")) return response;
 
+            const html = `#{escaped}`;
             return new HTMLRewriter()
               .on("body", {
                 element(el) {
-                  el.append(#{injection.to_json}, { html: true });
+                  el.append(html, { html: true });
                 }
               })
               .transform(response);
