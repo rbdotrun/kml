@@ -27,6 +27,9 @@ module Kml
       # @param created_at [String, nil] Creation timestamp (for resuming)
       # @param tunnel_id [String, nil] Existing tunnel ID (for resuming)
       # @param tunnel_token [String, nil] Existing tunnel token (for resuming)
+      # @param worker_files [Hash<String, String>] Extra files to upload to worker (filename => content)
+      # @param worker_bindings [Hash<String, String>] Extra env bindings for worker
+      # @param worker_injection [String, nil] HTML to inject into responses
       def initialize(
         slug:,
         ai:,
@@ -43,7 +46,10 @@ module Kml
         access_token: nil,
         created_at: nil,
         tunnel_id: nil,
-        tunnel_token: nil
+        tunnel_token: nil,
+        worker_files: {},
+        worker_bindings: {},
+        worker_injection: nil
       )
         @slug = slug
         @ai = ai
@@ -62,6 +68,9 @@ module Kml
         @uuid = SecureRandom.uuid
         @tunnel_id = tunnel_id
         @tunnel_token = tunnel_token
+        @worker_files = worker_files
+        @worker_bindings = worker_bindings
+        @worker_injection = worker_injection
       end
 
       def public_url
@@ -82,6 +91,38 @@ module Kml
         rescue StandardError
           false
         end
+      end
+
+      # Fetch process statuses from overmind
+      # @return [Array<Hash>] Array of { name:, status: } hashes
+      def process_statuses
+        return [] unless @sandbox_id
+
+        result = @daytona.execute_command(
+          sandbox_id: @sandbox_id,
+          command: "cd #{code_path} && overmind status 2>/dev/null || echo ''",
+          timeout: 10
+        )
+
+        parse_overmind_status(result["result"].to_s)
+      rescue StandardError
+        []
+      end
+
+      # Restart a specific process managed by overmind
+      # @param process_name [String] Name of the process to restart
+      # @return [Boolean] true if successful
+      def restart_process(process_name)
+        return false unless @sandbox_id
+
+        @daytona.execute_command(
+          sandbox_id: @sandbox_id,
+          command: "cd #{code_path} && overmind restart #{process_name}",
+          timeout: 30
+        )
+        true
+      rescue StandardError
+        false
       end
 
       # Create sandbox and start the session
@@ -328,11 +369,11 @@ module Kml
             end
 
             puts "  $ #{cmd}"
-            block&.call(:install_start, { name: name, command: cmd })
+            block&.call(:install_start, { name:, command: cmd })
             result = exec_sh("cd #{code_path} && #{mise_prefix} POSTGRES_DB=#{db_name} #{cmd}")
             exit_code = result["exitCode"]
             output = result["result"]
-            block&.call(:install_complete, { name: name, command: cmd, exit_code: exit_code, output: output })
+            block&.call(:install_complete, { name:, command: cmd, exit_code:, output: })
             if exit_code != 0
               raise InstallError, "Install command failed: #{cmd}\nExit code: #{exit_code}\nOutput: #{output}"
             end
@@ -371,6 +412,7 @@ module Kml
 
         # Deploy Cloudflare Worker for auth in front of tunnel
         # Worker validates access_token and sets HttpOnly cookie, then passes through to tunnel
+        # Optionally injects HTML into responses (for console, etc.)
         def deploy_worker
           return unless @cloudflare
 
@@ -382,7 +424,10 @@ module Kml
           @cloudflare.deploy_worker(
             worker_name:,
             access_token: @access_token,
-            hostname:
+            hostname:,
+            files: @worker_files,
+            bindings: @worker_bindings,
+            injection: @worker_injection
           )
           puts " done"
         end
@@ -392,6 +437,20 @@ module Kml
             "https://#{$1}/#{$2}"
           else
             url
+          end
+        end
+
+        # Parse overmind status output
+        # Input: "web   | running\ncss   | running\n"
+        # Output: [{ name: "web", status: "running" }, { name: "css", status: "running" }]
+        def parse_overmind_status(output)
+          output.split("\n").filter_map do |line|
+            next if line.strip.empty?
+
+            parts = line.split("|").map(&:strip)
+            next unless parts.length == 2
+
+            { name: parts[0], status: parts[1] }
           end
         end
     end
